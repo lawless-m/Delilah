@@ -1,3 +1,26 @@
+// DBISAM NULL semantics audit (verified live against YOURHOST):
+//
+//   shape                  DBISAM         ANSI 3VL    safe to push as-is?
+//   col =  x               excludes NULL  excludes    YES
+//   col <> x               INCLUDES NULL  excludes    NO  — must wrap with "AND col IS NOT NULL"
+//   col <  x   col <= x    excludes NULL  excludes    YES
+//   col >  x   col >= x    excludes NULL  excludes    YES
+//   col IN (...)           excludes NULL  excludes    YES
+//   col NOT IN (...)       excludes NULL  excludes    YES
+//   col IS NULL            matches NULL   matches     YES
+//   col IS NOT NULL        excludes NULL  excludes    YES
+//
+// The divergence is `<>` only: DBISAM treats `NULL <> x` as TRUE
+// (treating NULL as "some other value"); ANSI says NULL — row excluded.
+// MrsFlow's Dbisam dialect flags the broader behaviour via
+// `null_equals_null() -> true`. Verified on CUSTOMER.EVCUSTOMER (1 NULL
+// row, 9554 total): `count(*) WHERE EVCUSTOMER <> TRUE` returned 6009
+// instead of the ANSI-correct 6008. Compensation here renders `<>` as
+// `(col <> x AND col IS NOT NULL)` so DBISAM applies ANSI semantics.
+//
+// NULL literals on either side of any comparison are never pushed
+// (RenderValue refuses NULL); callers must use IS [NOT] NULL instead.
+
 #include "dbisam/storage/dbisam_filter_render.hpp"
 
 #include "duckdb/common/enums/expression_type.hpp"
@@ -137,6 +160,11 @@ std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
         if (!op) return std::nullopt;
         auto lit = RenderValue(cf.constant);
         if (!lit) return std::nullopt;
+        // DBISAM NULL divergence — see top-of-file audit table. `<>`
+        // includes NULL rows; wrap to enforce ANSI semantics.
+        if (cf.comparison_type == ExpressionType::COMPARE_NOTEQUAL) {
+            return "(" + qcol + " " + *op + " " + *lit + " AND " + qcol + " IS NOT NULL)";
+        }
         return qcol + " " + *op + " " + *lit;
     }
     case TableFilterType::CONJUNCTION_AND: {
