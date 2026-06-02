@@ -144,3 +144,20 @@ target_link_libraries(test_phase5_dump PRIVATE dbisam_protocol)
 add_executable(test_phase7 test/test_phase7.cpp)
 target_link_libraries(test_phase7 PRIVATE dbisam_protocol)
 add_test(NAME phase7 COMMAND test_phase7)
+
+add_executable(test_text test/test_text.cpp)
+target_link_libraries(test_text PRIVATE dbisam_protocol)
+add_test(NAME text COMMAND test_text)
+
+# parse_attach_path lives in src/storage/ (not the protocol layer because
+# it includes the duckdb-facing dbisam/storage/* headers). Build directly
+# rather than via dbisam_protocol.
+add_executable(test_attach_options
+    test/test_attach_options.cpp
+    src/storage/dbisam_attach_options.cpp
+)
+target_link_libraries(test_attach_options PRIVATE dbisam_protocol)
+target_include_directories(test_attach_options PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/include
+)
+add_test(NAME attach_options COMMAND test_attach_options)
