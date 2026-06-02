@@ -89,10 +89,14 @@ optional_ptr<CatalogEntry> DbisamTransaction::GetCatalogEntry(const std::string 
     }
 
     CreateTableInfo info(catalog_.GetMainSchema(), name);
+    std::vector<dbisam::FieldType> field_types;
+    field_types.reserve(q.columns.size());
     for (const auto &col : q.columns) {
         info.columns.AddColumn(ColumnDefinition(col.name, MapFieldType(col.field_type)));
+        field_types.push_back(col.field_type);
     }
-    auto entry = make_uniq<DbisamTableEntry>(catalog_, catalog_.GetMainSchema(), info);
+    auto entry = make_uniq<DbisamTableEntry>(catalog_, catalog_.GetMainSchema(), info,
+                                             std::move(field_types));
     auto *raw = entry.get();
     entries_[name] = std::move(entry);
     return raw;

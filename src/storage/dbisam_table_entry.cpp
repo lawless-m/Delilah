@@ -24,8 +24,10 @@
 
 namespace duckdb {
 
-DbisamTableEntry::DbisamTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-    : TableCatalogEntry(catalog, schema, info) {}
+DbisamTableEntry::DbisamTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
+                                   std::vector<dbisam::FieldType> field_types)
+    : TableCatalogEntry(catalog, schema, info),
+      source_field_types(std::move(field_types)) {}
 
 unique_ptr<BaseStatistics> DbisamTableEntry::GetStatistics(ClientContext &, column_t) {
     return nullptr;
@@ -46,6 +48,7 @@ struct DbisamScanBindData : public TableFunctionData {
     DbisamTableEntry *table;
     std::vector<std::string> all_names;
     std::vector<LogicalType> all_types;
+    std::vector<dbisam::FieldType> all_field_types; // mirrors table->source_field_types
 };
 
 struct DbisamScanState : public GlobalTableFunctionState {
@@ -65,6 +68,7 @@ static unique_ptr<FunctionData> DbisamAttachedScanBind(ClientContext &,
     auto bind = make_uniq<DbisamScanBindData>();
     bind->table = reinterpret_cast<DbisamTableEntry *>(input.inputs[0].GetPointer());
     auto &table = *bind->table;
+    bind->all_field_types = table.source_field_types;
     for (auto &col : table.GetColumns().Logical()) {
         bind->all_names.push_back(col.GetName());
         bind->all_types.push_back(col.GetType());
@@ -72,6 +76,12 @@ static unique_ptr<FunctionData> DbisamAttachedScanBind(ClientContext &,
         return_types.push_back(col.GetType());
     }
     return std::move(bind);
+}
+
+static bool IsBlobShaped(dbisam::FieldType ft) {
+    return ft == dbisam::FieldType::Blob
+        || ft == dbisam::FieldType::Memo
+        || ft == dbisam::FieldType::Graphic;
 }
 
 // Quote an identifier per the DBISAM/Dibdog grammar — double quotes,
@@ -94,15 +104,39 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
     auto state = make_uniq<DbisamScanState>();
     state->column_ids = input.column_ids;
 
+    // Detect projections that touch a Memo/Blob/Graphic column. The
+    // blob resolver in query_decoded uses columns[0] of the response
+    // as the PK source (row[first_off+1..+pk_width]); if the projection
+    // dropped the PK, the slot lookup fails server-side and every blob
+    // comes back empty. Force-include the PK column (table column 0)
+    // at SELECT position 0 in that case, then skip it in the output
+    // mapping.
+    bool needs_pk = false;
+    for (auto cid : state->column_ids) {
+        if (cid < bind.all_field_types.size() && IsBlobShaped(bind.all_field_types[cid])) {
+            needs_pk = true;
+            break;
+        }
+    }
+    // Don't double-add if the user already projected column 0.
+    bool pk_already_in_projection = false;
+    for (auto cid : state->column_ids) {
+        if (cid == 0) { pk_already_in_projection = true; break; }
+    }
+    bool pk_injected = needs_pk && !pk_already_in_projection && !bind.all_names.empty();
+
     // Two passes through column_ids:
     //   (a) build the SELECT — real columns only, in the order they
-    //       appear in column_ids;
+    //       appear in column_ids, optionally prefixed by the PK;
     //   (b) build output_to_projected — for each output column, the
     //       index into the projected response (or SIZE_MAX for ROWID).
     // DuckDB sends COLUMN_IDENTIFIER_ROW_ID (== UINT64_MAX) for queries
     // that only need the row count (e.g. count(*)); the output vector
     // is BIGINT and we just emit sequential row indices into it.
     std::vector<std::string> select_cols;
+    if (pk_injected) {
+        select_cols.push_back(QuoteIdent(bind.all_names[0]));
+    }
     state->output_to_projected.reserve(state->column_ids.size());
     for (auto cid : state->column_ids) {
         if (cid == COLUMN_IDENTIFIER_ROW_ID || cid >= bind.all_names.size()) {
@@ -304,6 +338,7 @@ TableFunction DbisamTableEntry::GetScanFunction(ClientContext &, unique_ptr<Func
     // information from `input.inputs[0]` (a POINTER to `this`).
     auto bind = make_uniq<DbisamScanBindData>();
     bind->table = this;
+    bind->all_field_types = source_field_types;
     for (auto &col : GetColumns().Logical()) {
         bind->all_names.push_back(col.GetName());
         bind->all_types.push_back(col.GetType());
