@@ -45,8 +45,8 @@ int main() {
 
     try {
         auto client = Client::connect_and_login(opts);
-        std::printf("handshake OK: fd=%d compression=%d batch=%u slot_len=%zu\n",
-                    client.transport().fd(),
+        std::printf("handshake OK: fd=%lld compression=%d batch=%u slot_len=%zu\n",
+                    static_cast<long long>(client.transport().fd()),
                     client.compression() ? 1 : 0,
                     client.batch_size(),
                     client.blob_slot_length());

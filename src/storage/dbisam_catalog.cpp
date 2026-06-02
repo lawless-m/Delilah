@@ -3,6 +3,7 @@
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/storage/database_size.hpp"
 
 namespace duckdb {
