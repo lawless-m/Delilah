@@ -187,4 +187,4 @@ The DuckDB extension code is original. Bundled third-party:
 [mrsflow]: https://github.com/lawless-m/MrsFlow
 [exportking]: https://github.com/lawless-m/ExportKing
 [derek]: file:///nonreplicated/Git/Derek
-[dibdog]: file:///nonreplicated/Git/Dibdog
+[dibdog]: https://github.com/lawless-m/Dibdog
