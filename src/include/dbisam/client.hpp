@@ -46,6 +46,13 @@ struct ConnOpts {
     // cursor.@+0x3672 — table's physical-record bookmark size.
     // 56 matches every ex3win table with a single-column ≤14-char PK.
     size_t blob_slot_length = 56;
+    // Catalog behaviour (not a wire field): when true, the first catalog
+    // access probes every table's schema once and caches it for the
+    // session, so information_schema / SHOW ALL TABLES / JDBC getColumns
+    // (DBeaver) see full columns. Default false = lazy: SHOW TABLES is
+    // instant but catalog-wide column introspection is empty until a
+    // table is queried. Set via ATTACH (..., EAGER_SCHEMA true).
+    bool eager_schema = false;
 };
 
 class Client {
