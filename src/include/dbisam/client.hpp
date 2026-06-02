@@ -18,8 +18,13 @@
 #include "dbisam/schema.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace dbisam {
+class CursorRunner;
+}
 
 namespace dbisam {
 
@@ -71,6 +76,26 @@ public:
     // PrepareStatement → drive_cursor → decode every row. Caps at
     // `target_rows` if non-zero (0 = unlimited).
     QueryResult query_decoded(const std::string &sql, size_t target_rows = 0);
+
+    // Streaming alternative to query_decoded — PrepareStatement, parse
+    // schema, open the cursor (Execute + Receive poll + SetToBegin),
+    // and hand back a CursorRunner the caller pulls batches from. The
+    // Client must outlive the returned runner (its Transport is borrowed).
+    struct StreamingScan {
+        std::vector<Column> columns;
+        std::unique_ptr<CursorRunner> runner;
+    };
+    StreamingScan start_streaming(const std::string &sql);
+
+    // Decode one batch of row spans into CellValues, resolving any
+    // blob/memo/graphic columns inline via the live transport. Assumes
+    // `columns[0]` is the PK (callers using projection pushdown must
+    // ensure PK injection — see dbisam_table_entry.cpp). `bookmarks` is
+    // optional; phys can be 0 if absent.
+    std::vector<std::vector<CellValue>> decode_batch_with_blobs(
+        const std::vector<Column> &columns,
+        const std::vector<std::pair<const uint8_t *, size_t>> &rows,
+        const std::vector<std::pair<const uint8_t *, size_t>> &bookmarks);
 
     // SQLTables-equivalent native request (reqcode 0x0032). Returns the
     // list of table names in the attached catalog. No SQL involved —

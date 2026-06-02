@@ -9,6 +9,7 @@
 #include "dbisam/storage/dbisam_filter_render.hpp"
 #include "dbisam/storage/dbisam_transaction.hpp"
 
+#include "dbisam/cursor.hpp"
 #include "dbisam/row.hpp"
 
 #include "duckdb/common/types/date.hpp"
@@ -57,8 +58,21 @@ struct DbisamScanState : public GlobalTableFunctionState {
     // or SIZE_MAX if this output column is a ROWID (emit row-counter).
     std::vector<size_t> output_to_projected;
     std::vector<dbisam::Column> projected_columns;
-    std::vector<std::vector<dbisam::CellValue>> rows;
-    idx_t row_offset = 0;
+
+    // Streaming state — keep the Client (transport) alive for as long
+    // as we're scanning, and pull RecordBlocks lazily. When DuckDB
+    // hits its LIMIT and stops calling Execute, this state is
+    // destroyed and the CursorRunner destructor sends cleanup.
+    std::unique_ptr<dbisam::Client> client;
+    std::unique_ptr<dbisam::CursorRunner> cursor;
+
+    // Most-recently-decoded batch (rows + blobs already resolved by
+    // Client::decode_batch_with_blobs). We emit STANDARD_VECTOR_SIZE
+    // rows at a time from it; when exhausted, pull the next block.
+    std::vector<std::vector<dbisam::CellValue>> current_batch;
+    idx_t batch_offset = 0;
+    idx_t total_emitted = 0; // used for ROWID generation
+    bool exhausted = false;
 };
 
 static unique_ptr<FunctionData> DbisamAttachedScanBind(ClientContext &,
@@ -188,12 +202,14 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
         std::fprintf(stderr, "[dbisam-sql] %s\n", sql.c_str());
     }
     // Fresh Client per scan — native protocol desyncs when multiple
-    // queries share a session (per ExportKing README).
+    // queries share a session (per ExportKing README). Open it now
+    // and keep alive in state for streaming; CursorRunner borrows the
+    // transport.
     auto &txn = DbisamTransaction::Get(context, bind.table->catalog);
-    auto client = txn.OpenClient();
-    auto result = client.query_decoded(sql, 0);
-    state->projected_columns = std::move(result.columns);
-    state->rows = std::move(result.rows);
+    state->client = std::make_unique<dbisam::Client>(txn.OpenClient());
+    auto scan = state->client->start_streaming(sql);
+    state->projected_columns = std::move(scan.columns);
+    state->cursor = std::move(scan.runner);
     return std::move(state);
 }
 
@@ -284,15 +300,37 @@ static void DbisamAttachedScanExecute(ClientContext &, TableFunctionInput &input
     auto &state = input.global_state->Cast<DbisamScanState>();
     (void)bind;
 
-    idx_t total = state.rows.size();
-    if (state.row_offset >= total) {
-        output.SetCardinality(0);
-        return;
+    // Pull more rows from the server if we've drained the current batch.
+    if (state.batch_offset >= state.current_batch.size()) {
+        if (state.exhausted || !state.cursor) {
+            output.SetCardinality(0);
+            return;
+        }
+        // Skip empty/blank batches that occasionally arrive before the
+        // server signals EoC.
+        while (state.batch_offset >= state.current_batch.size() && !state.exhausted) {
+            auto block = state.cursor->next_block();
+            if (block.eoc && block.rows.empty()) {
+                state.exhausted = true;
+                output.SetCardinality(0);
+                return;
+            }
+            state.current_batch = state.client->decode_batch_with_blobs(
+                state.projected_columns, block.rows, block.bookmarks);
+            state.batch_offset = 0;
+            if (block.eoc) {
+                state.exhausted = true; // emit this batch, stop after
+            }
+        }
+        if (state.current_batch.empty()) {
+            output.SetCardinality(0);
+            return;
+        }
     }
-    idx_t emit = std::min<idx_t>(STANDARD_VECTOR_SIZE, total - state.row_offset);
 
-    // Each output column is either a ROWID (emit sequential int64) or
-    // maps to a projected response column via output_to_projected[outcol].
+    idx_t available = state.current_batch.size() - state.batch_offset;
+    idx_t emit = std::min<idx_t>(STANDARD_VECTOR_SIZE, available);
+
     for (idx_t outcol = 0; outcol < output.ColumnCount(); ++outcol) {
         auto &out = output.data[outcol];
         out.SetVectorType(VectorType::FLAT_VECTOR);
@@ -300,10 +338,9 @@ static void DbisamAttachedScanExecute(ClientContext &, TableFunctionInput &input
                                    ? state.output_to_projected[outcol]
                                    : SIZE_MAX;
         if (projected_idx == SIZE_MAX) {
-            // ROWID — emit row counter as int64.
             auto data = FlatVector::GetData<int64_t>(out);
             for (idx_t r = 0; r < emit; ++r) {
-                data[r] = static_cast<int64_t>(state.row_offset + r);
+                data[r] = static_cast<int64_t>(state.total_emitted + r);
             }
             continue;
         }
@@ -313,12 +350,17 @@ static void DbisamAttachedScanExecute(ClientContext &, TableFunctionInput &input
         }
         const auto ft = state.projected_columns[projected_idx].field_type;
         for (idx_t r = 0; r < emit; ++r) {
-            const auto &cell = state.rows[state.row_offset + r][projected_idx];
-            WriteCell(out, r, ft, cell);
+            const auto &row_cells = state.current_batch[state.batch_offset + r];
+            if (projected_idx >= row_cells.size()) {
+                FlatVector::SetNull(out, r, true);
+            } else {
+                WriteCell(out, r, ft, row_cells[projected_idx]);
+            }
         }
     }
     output.SetCardinality(emit);
-    state.row_offset += emit;
+    state.batch_offset += emit;
+    state.total_emitted += emit;
 }
 
 } // namespace
