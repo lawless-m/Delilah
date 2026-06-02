@@ -32,10 +32,19 @@ void DbisamSchemaEntry::Scan(ClientContext &context, CatalogType type,
     if (type != CatalogType::TABLE_ENTRY) {
         return;
     }
+    auto &cat = catalog.Cast<DbisamCatalog>();
     auto &txn = DbisamTransaction::Get(context, catalog);
-    for (auto &name : txn.GetTableNames()) {
-        auto entry = txn.GetCatalogEntry(name);
-        if (entry) callback(*entry);
+    if (cat.opts.eager_schema) {
+        cat.EnsureEagerLoaded(); // probe + cache all tables once this session
+        for (auto &name : txn.GetTableNames()) {
+            auto entry = txn.GetCatalogEntry(name); // full entry, from cache
+            if (entry) callback(*entry);
+        }
+    } else {
+        for (auto &name : txn.GetTableNames()) {
+            auto entry = txn.GetScanEntry(name); // name-only; no per-table probe
+            if (entry) callback(*entry);
+        }
     }
 }
 

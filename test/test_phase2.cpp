@@ -72,7 +72,10 @@ static void wrap_layout_matches_poc() {
     std::vector<uint8_t> body{0xAA, 0xBB, 0xCC, 0xDD};
     auto pkt = wrap(body);
     CHECK(pkt.size() == 24);
-    CHECK(std::memcmp(pkt.data(), GUID.data(), 16) == 0);
+    // Qualify: on Windows the Winsock headers (pulled in transitively via
+    // framing.hpp's socket shim) define a global ::GUID that otherwise
+    // collides with dbisam::GUID under `using namespace dbisam`.
+    CHECK(std::memcmp(pkt.data(), dbisam::GUID.data(), 16) == 0);
     CHECK(pkt[16] == 24 && pkt[17] == 0 && pkt[18] == 0 && pkt[19] == 0);
     CHECK(std::memcmp(pkt.data() + 20, body.data(), 4) == 0);
 }

@@ -2,7 +2,9 @@
 
 #include "miniz.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace dbisam {
 
@@ -234,9 +236,21 @@ Transport connect(const std::string &host, uint16_t port) {
         throw IoError("resolve " + host + ": " + std::string(gai_strerror(rc)));
     }
 
+    // Prefer IPv4. A hostname can resolve to ::1 (IPv6 loopback) ahead of
+    // the real IPv4 address — notably on Windows — and a *refused* ::1
+    // connect can take ~2s to surface. Since we open a fresh connection
+    // per schema probe (one per table), trying a dead ::1 first would add
+    // ~2s × table-count to catalog enumeration. Order AF_INET first so the
+    // reachable address is attempted before any IPv6 candidate.
+    std::vector<addrinfo *> addrs;
+    for (auto *ai = res; ai != nullptr; ai = ai->ai_next) addrs.push_back(ai);
+    std::stable_sort(addrs.begin(), addrs.end(), [](addrinfo *a, addrinfo *b) {
+        return a->ai_family == AF_INET && b->ai_family != AF_INET;
+    });
+
     socket_t fd = DBISAM_INVALID_SOCKET;
     std::string last_err;
-    for (auto *ai = res; ai != nullptr; ai = ai->ai_next) {
+    for (auto *ai : addrs) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd == DBISAM_INVALID_SOCKET) {
             last_err = socket_last_error();

@@ -3,8 +3,9 @@
 // Each logical query opens its own short-lived `Client` connection
 // because the native protocol desyncs when multiple queries share a
 // session (see ExportKing README and KNOWN_BUGS.md). The transaction
-// itself only owns the catalog reference + cached TableCatalogEntry
-// instances; it does NOT hold a long-lived Client.
+// holds no state of its own: the schema cache (table names + entries)
+// lives on the DbisamCatalog so it persists across statements; these
+// methods just forward to it.
 //
 // DBISAM access is SELECT-only — Start/Commit/Rollback are no-ops.
 
@@ -12,10 +13,9 @@
 
 #include "dbisam/client.hpp"
 
-#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
-#include <mutex>
+#include <string>
 #include <vector>
 
 namespace duckdb {
@@ -27,12 +27,16 @@ public:
     DbisamTransaction(DbisamCatalog &catalog, TransactionManager &mgr, ClientContext &context);
     ~DbisamTransaction() override;
 
-    // Lazy: fetch and cache the TableCatalogEntry for `name`. Returns
-    // nullptr if the table doesn't exist on the server.
+    // Full, schema-probed entry for `name` (query / LookupEntry path).
+    // Returns nullptr if the table doesn't exist on the server.
     optional_ptr<CatalogEntry> GetCatalogEntry(const std::string &name);
 
-    // Snapshot the table list (cached after first call this transaction).
+    // Table names (cached on the catalog after first call).
     const std::vector<std::string> &GetTableNames();
+
+    // Entry for catalog enumeration (SHOW TABLES). Name-only in lazy mode
+    // (no schema probe); full when eager mode has pre-loaded it.
+    optional_ptr<CatalogEntry> GetScanEntry(const std::string &name);
 
     // Open a fresh, short-lived Client for one query against the
     // catalog's server. Caller owns it and discards after use.
@@ -42,10 +46,6 @@ public:
 
 private:
     DbisamCatalog &catalog_;
-    std::mutex lock_;
-    case_insensitive_map_t<unique_ptr<CatalogEntry>> entries_;
-    std::vector<std::string> table_names_;
-    bool tables_loaded_ = false;
 };
 
 } // namespace duckdb

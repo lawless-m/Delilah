@@ -86,6 +86,29 @@ ATTACH 'YOURHOST/YOURCATALOG' AS em
      ENCRYPT_PASSWORD 'elevatesoft', PORT 12005, COMPRESSION TRUE);
 ```
 
+### Schema loading: lazy (default) vs `EAGER_SCHEMA`
+
+Listing the catalog (`SHOW TABLES`) only needs table *names*, so by default
+Delilah does **not** probe each table's columns up front — enumeration is
+instant even on catalogs with hundreds of tables, and column schemas are
+fetched on demand when you actually query a table.
+
+The trade-off: catalog-*wide* column introspection
+(`information_schema.columns` across all tables, `SHOW ALL TABLES`, and the
+JDBC `getColumns` metadata a GUI like **DBeaver** uses to populate its
+column browser) reports a table's columns as empty until that table has
+been queried directly. If you browse the catalog in such a tool, attach
+with `EAGER_SCHEMA true`:
+
+```sql
+ATTACH 'YOURHOST/YOURCATALOG' AS em (TYPE dbisam, READ_ONLY, EAGER_SCHEMA true);
+```
+
+This probes every table's schema once on first catalog access (serial — the
+server rejects concurrent login storms) and caches it for the session, so
+all column metadata is complete. Expect a one-off delay proportional to the
+table count (~15 s for ~600 tables); subsequent access is instant.
+
 ## What works
 
 | Capability               | Where                                                                       |
@@ -187,4 +210,4 @@ The DuckDB extension code is original. Bundled third-party:
 [mrsflow]: https://github.com/lawless-m/MrsFlow
 [exportking]: https://github.com/lawless-m/ExportKing
 [derek]: file:///nonreplicated/Git/Derek
-[dibdog]: file:///nonreplicated/Git/Dibdog
+[dibdog]: https://github.com/lawless-m/Dibdog

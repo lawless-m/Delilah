@@ -9,11 +9,23 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# DuckDB links the static MSVC runtime (/MT). Our targets must match or the
+# link fails with LNK2038 RuntimeLibrary mismatch. CMP0091 (NEW under our
+# cmake_minimum_required) makes this abstraction authoritative over flags.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
 include(FetchContent)
+
+# We only need libduckdb_static to link the extension against — not DuckDB's
+# own unittest/benchmark suites. Skipping them speeds the build and, on
+# Windows, sidesteps a std::byte vs <rpcndr.h> ::byte collision in DuckDB's
+# test_common.cpp that has nothing to do with this extension.
+set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 
 set(DUCKDB_VERSION_NORMALIZED "v1.5.2")
 
