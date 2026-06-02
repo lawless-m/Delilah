@@ -1,9 +1,11 @@
 // dbisam_scan(host, user, password, catalog, sql [, encrypt_password=...,
 //             port=..., compression=...]) — DuckDB table function.
 //
-// Opens one Exportmaster session per call, runs the SQL, materialises
-// the full result into bind data, then streams it out one DataChunk at
-// a time during execution.
+// Opens one Exportmaster session for schema discovery (during Bind) and
+// a second one for the actual scan (during InitGlobal). The scan
+// connection holds the cursor open across Execute calls and pulls one
+// RecordBlock at a time so DuckDB's LIMIT naturally stops the fetch
+// after the first batch that satisfies it.
 //
 // SELECT-only: this function does PrepareStatement / ExecuteStatement
 // against the server; it never invokes DDL/DML reqcodes. The SQL
@@ -11,6 +13,7 @@
 // hit the server's own access controls, not this extension).
 
 #include "dbisam/client.hpp"
+#include "dbisam/cursor.hpp"
 #include "dbisam/row.hpp"
 #include "dbisam/text.hpp"
 
@@ -22,6 +25,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include <cctype>
+#include <memory>
 #include <string>
 #include <utility>
 #include <variant>
@@ -56,12 +61,17 @@ LogicalType map_field_type(dbisam::FieldType ft) {
 }
 
 struct DbisamScanBindData : public TableFunctionData {
-    std::vector<dbisam::Column> columns;
-    std::vector<std::vector<dbisam::CellValue>> rows;
+    dbisam::ConnOpts opts;
+    std::string sql;
+    std::vector<dbisam::Column> columns; // schema discovered at bind time
 };
 
 struct DbisamScanState : public GlobalTableFunctionState {
-    idx_t row_offset = 0;
+    std::unique_ptr<dbisam::Client> client;
+    std::unique_ptr<dbisam::CursorRunner> cursor;
+    std::vector<std::vector<dbisam::CellValue>> current_batch;
+    idx_t batch_offset = 0;
+    bool exhausted = false;
 };
 
 static std::string require_string(const Value &v, const char *what) {
@@ -78,48 +88,80 @@ static unique_ptr<FunctionData> DbisamScanBind(ClientContext &ctx,
     if (input.inputs.size() < 5) {
         throw BinderException("dbisam_scan(host, user, password, catalog, sql, ...) requires 5 positional args");
     }
-    dbisam::ConnOpts opts;
-    opts.host             = require_string(input.inputs[0], "host");
-    opts.user             = require_string(input.inputs[1], "user");
-    opts.password         = require_string(input.inputs[2], "password");
-    opts.catalog          = require_string(input.inputs[3], "catalog");
-    std::string sql       = require_string(input.inputs[4], "sql");
-    opts.encrypt_password = "elevatesoft";
-    opts.compression      = true;
+    auto bind = make_uniq<DbisamScanBindData>();
+    bind->opts.host             = require_string(input.inputs[0], "host");
+    bind->opts.user             = require_string(input.inputs[1], "user");
+    bind->opts.password         = require_string(input.inputs[2], "password");
+    bind->opts.catalog          = require_string(input.inputs[3], "catalog");
+    bind->sql                   = require_string(input.inputs[4], "sql");
+    bind->opts.encrypt_password = "elevatesoft";
+    bind->opts.compression      = true;
 
     auto it = input.named_parameters.find("encrypt_password");
     if (it != input.named_parameters.end() && !it->second.IsNull()) {
-        opts.encrypt_password = it->second.ToString();
+        bind->opts.encrypt_password = it->second.ToString();
     }
     it = input.named_parameters.find("port");
     if (it != input.named_parameters.end() && !it->second.IsNull()) {
-        opts.port = static_cast<uint16_t>(it->second.GetValue<int32_t>());
+        bind->opts.port = static_cast<uint16_t>(it->second.GetValue<int32_t>());
     }
     it = input.named_parameters.find("compression");
     if (it != input.named_parameters.end() && !it->second.IsNull()) {
-        opts.compression = it->second.GetValue<bool>();
+        bind->opts.compression = it->second.GetValue<bool>();
+    }
+    // Optional explicit DBISAM TOP-n cap. The SQL goes verbatim to the
+    // server; appending `TOP n` here lets the server stop early instead
+    // of streaming-with-early-termination on our side. Users who write
+    // the TOP themselves don't need this.
+    it = input.named_parameters.find("top");
+    if (it != input.named_parameters.end() && !it->second.IsNull()) {
+        int64_t n = it->second.GetValue<int64_t>();
+        if (n > 0) {
+            // Only append if the user hasn't already written TOP. Cheap
+            // case-insensitive check: look for " TOP " near the end.
+            std::string upper = bind->sql;
+            for (auto &c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (upper.find(" TOP ") == std::string::npos) {
+                bind->sql += " TOP " + std::to_string(n);
+            }
+        }
     }
 
-    auto result = make_uniq<DbisamScanBindData>();
+    // Schema-only probe: connect, send PrepareStatement, parse columns,
+    // disconnect. InitGlobal will open a fresh connection for the scan.
     try {
-        auto client = dbisam::Client::connect_and_login(opts);
-        auto q = client.query_decoded(sql, 0);
-        result->columns = std::move(q.columns);
-        result->rows = std::move(q.rows);
+        auto probe = dbisam::Client::connect_and_login(bind->opts);
+        auto resp = probe.query_raw(bind->sql);
+        auto [columns, _end] = dbisam::parse_schema(resp);
+        bind->columns = std::move(columns);
     } catch (const std::exception &e) {
         throw IOException("dbisam_scan: %s", e.what());
     }
 
-    for (const auto &c : result->columns) {
+    for (const auto &c : bind->columns) {
         return_types.push_back(map_field_type(c.field_type));
         names.push_back(c.name);
     }
-    return std::move(result);
+    return std::move(bind);
 }
 
-static unique_ptr<GlobalTableFunctionState> DbisamScanInitGlobal(ClientContext &ctx,
+static unique_ptr<GlobalTableFunctionState> DbisamScanInitGlobal(ClientContext &,
                                                                  TableFunctionInitInput &input) {
-    return make_uniq<DbisamScanState>();
+    auto &bind = input.bind_data->CastNoConst<DbisamScanBindData>();
+    auto state = make_uniq<DbisamScanState>();
+    try {
+        state->client = std::make_unique<dbisam::Client>(
+            dbisam::Client::connect_and_login(bind.opts));
+        auto scan = state->client->start_streaming(bind.sql);
+        state->cursor = std::move(scan.runner);
+        // The streaming-time schema should match the bind-time probe,
+        // but use the runner's columns (they reflect any per-call
+        // differences the server might emit).
+        bind.columns = std::move(scan.columns);
+    } catch (const std::exception &e) {
+        throw IOException("dbisam_scan: %s", e.what());
+    }
+    return std::move(state);
 }
 
 // Write one decoded cell into output.data[col].row at row index `row`.
@@ -204,8 +246,6 @@ static void write_cell(Vector &out, idx_t row, dbisam::FieldType ft,
                 StringVector::AddStringOrBlob(out,
                     const_char_ptr_cast(bytes->data()), bytes->size());
         } else if (auto *h = std::get_if<dbisam::BlobHandle>(&cell)) {
-            // Phase 6 leaves unresolved blob handles as their raw 8 bytes;
-            // Phase 7 will fetch the real payload via 0x0280.
             FlatVector::GetData<string_t>(out)[row] =
                 StringVector::AddStringOrBlob(out,
                     const_char_ptr_cast(h->bytes.data()), h->bytes.size());
@@ -217,26 +257,50 @@ static void write_cell(Vector &out, idx_t row, dbisam::FieldType ft,
     }
 }
 
-static void DbisamScanExecute(ClientContext &ctx, TableFunctionInput &input, DataChunk &output) {
+static void DbisamScanExecute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
     auto &bind = input.bind_data->Cast<DbisamScanBindData>();
     auto &state = input.global_state->Cast<DbisamScanState>();
 
-    idx_t total = bind.rows.size();
-    if (state.row_offset >= total) {
-        output.SetCardinality(0);
-        return;
+    // Pull more rows from the server if we've drained the current batch.
+    if (state.batch_offset >= state.current_batch.size()) {
+        if (state.exhausted || !state.cursor) {
+            output.SetCardinality(0);
+            return;
+        }
+        while (state.batch_offset >= state.current_batch.size() && !state.exhausted) {
+            auto block = state.cursor->next_block();
+            if (block.eoc && block.rows.empty()) {
+                state.exhausted = true;
+                output.SetCardinality(0);
+                return;
+            }
+            state.current_batch = state.client->decode_batch_with_blobs(
+                bind.columns, block.rows, block.bookmarks);
+            state.batch_offset = 0;
+            if (block.eoc) state.exhausted = true;
+        }
+        if (state.current_batch.empty()) {
+            output.SetCardinality(0);
+            return;
+        }
     }
-    idx_t emit = std::min<idx_t>(STANDARD_VECTOR_SIZE, total - state.row_offset);
-    for (idx_t col = 0; col < bind.columns.size(); ++col) {
+
+    idx_t available = state.current_batch.size() - state.batch_offset;
+    idx_t emit = std::min<idx_t>(STANDARD_VECTOR_SIZE, available);
+    for (idx_t col = 0; col < bind.columns.size() && col < output.ColumnCount(); ++col) {
         auto &out = output.data[col];
         out.SetVectorType(VectorType::FLAT_VECTOR);
         for (idx_t r = 0; r < emit; ++r) {
-            const auto &cell = bind.rows[state.row_offset + r][col];
-            write_cell(out, r, bind.columns[col].field_type, cell);
+            const auto &row_cells = state.current_batch[state.batch_offset + r];
+            if (col >= row_cells.size()) {
+                FlatVector::SetNull(out, r, true);
+            } else {
+                write_cell(out, r, bind.columns[col].field_type, row_cells[col]);
+            }
         }
     }
     output.SetCardinality(emit);
-    state.row_offset += emit;
+    state.batch_offset += emit;
 }
 
 } // namespace
@@ -249,6 +313,7 @@ void RegisterDbisamScan(ExtensionLoader &loader) {
     tf.named_parameters["encrypt_password"] = LogicalType::VARCHAR;
     tf.named_parameters["port"] = LogicalType::INTEGER;
     tf.named_parameters["compression"] = LogicalType::BOOLEAN;
+    tf.named_parameters["top"] = LogicalType::BIGINT;
     loader.RegisterFunction(tf);
 }
 
