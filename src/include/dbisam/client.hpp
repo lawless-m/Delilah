@@ -60,6 +60,7 @@ public:
     Transport &transport() { return transport_; }
     bool compression() const { return compression_; }
     uint32_t batch_size() const { return batch_size_; }
+    void set_batch_size(uint32_t v) { batch_size_ = v; }
     size_t blob_slot_length() const { return blob_slot_length_; }
 
     // Send a PrepareStatement (reqcode 0x0320) carrying `sql` and return

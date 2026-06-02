@@ -5,6 +5,7 @@
 // streams the buffer out chunk by chunk.
 
 #include "dbisam/storage/dbisam_table_entry.hpp"
+#include "dbisam/storage/dbisam_attached_scan_bind.hpp"
 #include "dbisam/storage/dbisam_catalog.hpp"
 #include "dbisam/storage/dbisam_filter_render.hpp"
 #include "dbisam/storage/dbisam_transaction.hpp"
@@ -46,12 +47,10 @@ TableStorageInfo DbisamTableEntry::GetStorageInfo(ClientContext &) {
 
 namespace {
 
-struct DbisamScanBindData : public TableFunctionData {
-    DbisamTableEntry *table;
-    std::vector<std::string> all_names;
-    std::vector<LogicalType> all_types;
-    std::vector<dbisam::FieldType> all_field_types; // mirrors table->source_field_types
-};
+// Bind data lives in dbisam_attached_scan_bind.hpp so the
+// OptimizerExtension can see the type. `using` here just keeps the
+// internal references short.
+using DbisamScanBindData = DbisamAttachedScanBindData;
 
 struct DbisamScanState : public GlobalTableFunctionState {
     std::vector<column_t> column_ids;
@@ -208,6 +207,13 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
     // transport.
     auto &txn = DbisamTransaction::Get(context, bind.table->catalog);
     state->client = std::make_unique<dbisam::Client>(txn.OpenClient());
+    // LIMIT pushdown: if the OptimizerExtension stamped a limit_hint
+    // on bind data, shrink the cursor's request size so the first
+    // ReadFirstRecordBlock fetches at most that many rows. DuckDB's
+    // LIMIT then stops calling Execute after the first batch.
+    if (bind.limit_hint > 0 && bind.limit_hint < state->client->batch_size()) {
+        state->client->set_batch_size(static_cast<uint32_t>(bind.limit_hint));
+    }
     auto scan = state->client->start_streaming(sql);
     state->projected_columns = std::move(scan.columns);
     state->cursor = std::move(scan.runner);

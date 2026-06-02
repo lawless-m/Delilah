@@ -10,6 +10,7 @@ namespace duckdb {
 
 void RegisterDbisamScan(ExtensionLoader &loader);
 void RegisterDbisamStorageExtension(ExtensionLoader &loader);
+void RegisterDbisamOptimizer(ExtensionLoader &loader);
 
 static constexpr const char *DBISAM_EXTENSION_VERSION = "0.0.1";
 
@@ -24,6 +25,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     loader.RegisterFunction(fn);
     RegisterDbisamScan(loader);
     RegisterDbisamStorageExtension(loader);
+    RegisterDbisamOptimizer(loader);
 }
 
 } // namespace duckdb
