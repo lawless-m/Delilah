@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "dbisam/sys_socket.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -41,16 +43,16 @@ inline std::vector<uint8_t> wrap(const std::vector<uint8_t> &body) {
 std::vector<uint8_t> deflate(const uint8_t *data, size_t len);
 std::vector<uint8_t> inflate(const uint8_t *data, size_t len);
 
-// Synchronous transport bound to a socket fd. Owns the fd lifetime.
+// Synchronous transport bound to a socket. Owns the socket lifetime.
 class Transport {
 public:
-    explicit Transport(int fd) : fd_(fd) {}
+    explicit Transport(socket_t fd) : fd_(fd) {}
     Transport(const Transport &) = delete;
     Transport &operator=(const Transport &) = delete;
-    Transport(Transport &&other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    Transport(Transport &&other) noexcept : fd_(other.fd_) { other.fd_ = DBISAM_INVALID_SOCKET; }
     ~Transport();
 
-    int fd() const { return fd_; }
+    socket_t fd() const { return fd_; }
 
     // Send a framed message and receive one framed reply. Returns the
     // reply body without the 20-byte envelope. DBISAM is strict
@@ -76,7 +78,7 @@ public:
     }
 
 private:
-    int fd_;
+    socket_t fd_;
 
     void write_all(const uint8_t *data, size_t len);
     void read_exact(uint8_t *buf, size_t len);

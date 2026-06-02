@@ -37,6 +37,7 @@ target_include_directories(dbisam_md5 PUBLIC third_party/md5)
 add_library(dbisam_protocol STATIC
     src/protocol/wire.cpp
     src/protocol/framing.cpp
+    src/protocol/sys_socket.cpp
     src/protocol/crypto.cpp
     src/protocol/msg.cpp
     src/protocol/schema.cpp
@@ -48,6 +49,9 @@ add_library(dbisam_protocol STATIC
     src/protocol/text.cpp
     src/protocol/client.cpp
 )
+if(WIN32)
+    target_link_libraries(dbisam_protocol PUBLIC ws2_32)
+endif()
 target_include_directories(dbisam_protocol
     PUBLIC
         ${CMAKE_SOURCE_DIR}/src/include
@@ -93,9 +97,16 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME}
         dbisam_protocol
         duckdb_static
         dummy_static_extension_loader
+)
+# GNU-ld-only linker flags; MSVC and other linkers reject them. The
+# upstream DuckDB build helper applies the equivalent flags itself
+# when EXTENSION_STATIC_BUILD is on for those toolchains.
+if(NOT WIN32 AND NOT APPLE)
+    target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
         -Wl,--gc-sections
         -Wl,--exclude-libs,ALL
-)
+    )
+endif()
 target_include_directories(${LOADABLE_EXTENSION_NAME}
     PRIVATE ${CMAKE_SOURCE_DIR}/src/include
 )

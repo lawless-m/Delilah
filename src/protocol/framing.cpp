@@ -2,15 +2,7 @@
 
 #include "miniz.hpp"
 
-#include <arpa/inet.h>
-#include <cerrno>
 #include <cstring>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 namespace dbisam {
 
@@ -94,18 +86,22 @@ std::vector<uint8_t> inflate(const uint8_t *data, size_t len) {
 }
 
 Transport::~Transport() {
-    if (fd_ >= 0) {
-        ::close(fd_);
+    if (fd_ != DBISAM_INVALID_SOCKET) {
+        close_socket(fd_);
     }
 }
 
 void Transport::write_all(const uint8_t *data, size_t len) {
     size_t off = 0;
     while (off < len) {
-        ssize_t n = ::send(fd_, data + off, len - off, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw IoError(std::string("send: ") + std::strerror(errno));
+        // ::send takes (const char*) on Windows, (const void*) on POSIX;
+        // reinterpret_cast for portability without #ifdef.
+        auto n = ::send(fd_,
+                        reinterpret_cast<const char *>(data + off),
+                        static_cast<int>(len - off), 0);
+        if (n == DBISAM_SOCKET_ERROR) {
+            if (socket_was_interrupted()) continue;
+            throw IoError("send: " + socket_last_error());
         }
         off += static_cast<size_t>(n);
     }
@@ -114,14 +110,16 @@ void Transport::write_all(const uint8_t *data, size_t len) {
 void Transport::read_exact(uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
-        ssize_t n = ::recv(fd_, buf + off, len - off, 0);
+        auto n = ::recv(fd_,
+                        reinterpret_cast<char *>(buf + off),
+                        static_cast<int>(len - off), 0);
         if (n == 0) {
             throw IoError("connection closed (got " + std::to_string(off) + " of " +
                           std::to_string(len) + ")");
         }
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw IoError(std::string("recv: ") + std::strerror(errno));
+        if (n == DBISAM_SOCKET_ERROR) {
+            if (socket_was_interrupted()) continue;
+            throw IoError("recv: " + socket_last_error());
         }
         off += static_cast<size_t>(n);
     }
@@ -225,61 +223,69 @@ std::vector<uint8_t> Transport::send_recv_compressed(const uint8_t *body, size_t
 }
 
 Transport connect(const std::string &host, uint16_t port) {
+    ensure_wsa_started();
+
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo *res = nullptr;
     int rc = ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
     if (rc != 0) {
-        throw IoError("resolve " + host + ": " + gai_strerror(rc));
+        throw IoError("resolve " + host + ": " + std::string(gai_strerror(rc)));
     }
-    int fd = -1;
+
+    socket_t fd = DBISAM_INVALID_SOCKET;
     std::string last_err;
     for (auto *ai = res; ai != nullptr; ai = ai->ai_next) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
-            last_err = std::strerror(errno);
+        if (fd == DBISAM_INVALID_SOCKET) {
+            last_err = socket_last_error();
             continue;
         }
         // 10s connect timeout via non-blocking + select.
-        int flags = ::fcntl(fd, F_GETFL, 0);
-        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+        set_socket_nonblocking(fd, true);
+        int crc = ::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         bool ok = false;
-        if (rc == 0) {
+        if (crc == 0) {
             ok = true;
-        } else if (errno == EINPROGRESS) {
+        } else if (socket_would_block()) {
             fd_set wfds;
             FD_ZERO(&wfds);
             FD_SET(fd, &wfds);
-            timeval tv{10, 0};
-            int sel = ::select(fd + 1, nullptr, &wfds, nullptr, &tv);
+            timeval tv;
+            tv.tv_sec = 10;
+            tv.tv_usec = 0;
+            // POSIX: nfds is highest fd + 1. Windows: nfds is ignored
+            // (FD_SETSIZE check happens internally). Passing fd+1 works
+            // on POSIX; on Windows the value is harmless.
+            int nfds = static_cast<int>(fd) + 1;
+            int sel = ::select(nfds, nullptr, &wfds, nullptr, &tv);
             if (sel > 0) {
                 int so_err = 0;
                 socklen_t so_len = sizeof(so_err);
-                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) == 0 && so_err == 0) {
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char *>(&so_err), &so_len) == 0 && so_err == 0) {
                     ok = true;
                 } else {
-                    last_err = std::strerror(so_err ? so_err : errno);
+                    last_err = so_err ? std::to_string(so_err) : socket_last_error();
                 }
             } else if (sel == 0) {
                 last_err = "connect timed out";
             } else {
-                last_err = std::strerror(errno);
+                last_err = socket_last_error();
             }
         } else {
-            last_err = std::strerror(errno);
+            last_err = socket_last_error();
         }
-        ::fcntl(fd, F_SETFL, flags);
+        set_socket_nonblocking(fd, false);
         if (ok) {
-            timeval rwt{30, 0};
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rwt, sizeof(rwt));
-            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &rwt, sizeof(rwt));
+            set_socket_timeout(fd, SO_RCVTIMEO, 30);
+            set_socket_timeout(fd, SO_SNDTIMEO, 30);
             ::freeaddrinfo(res);
             return Transport(fd);
         }
-        ::close(fd);
-        fd = -1;
+        close_socket(fd);
+        fd = DBISAM_INVALID_SOCKET;
     }
     ::freeaddrinfo(res);
     throw IoError("connect " + host + ":" + std::to_string(port) + ": " +
