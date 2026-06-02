@@ -34,7 +34,7 @@ void DbisamSchemaEntry::Scan(ClientContext &context, CatalogType type,
     }
     auto &txn = DbisamTransaction::Get(context, catalog);
     for (auto &name : txn.GetTableNames()) {
-        auto entry = txn.GetCatalogEntry(name);
+        auto entry = txn.GetScanEntry(name); // name-only; no per-table probe
         if (entry) callback(*entry);
     }
 }

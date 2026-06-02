@@ -34,6 +34,14 @@ public:
     // Snapshot the table list (cached after first call this transaction).
     const std::vector<std::string> &GetTableNames();
 
+    // Lightweight entry for catalog enumeration (SHOW TABLES): carries the
+    // table name but NO columns, so it costs no schema probe. Columns are
+    // resolved lazily via GetCatalogEntry when the table is queried. NOTE:
+    // catalog-wide column introspection (information_schema.columns over
+    // all tables, SHOW ALL TABLES) sees these as column-less until the
+    // table has been queried.
+    optional_ptr<CatalogEntry> GetScanEntry(const std::string &name);
+
     // Open a fresh, short-lived Client for one query against the
     // catalog's server. Caller owns it and discards after use.
     dbisam::Client OpenClient();
@@ -43,7 +51,8 @@ public:
 private:
     DbisamCatalog &catalog_;
     std::mutex lock_;
-    case_insensitive_map_t<unique_ptr<CatalogEntry>> entries_;
+    case_insensitive_map_t<unique_ptr<CatalogEntry>> entries_;      // fully-probed (query path)
+    case_insensitive_map_t<unique_ptr<CatalogEntry>> scan_entries_; // name-only (enumeration)
     std::vector<std::string> table_names_;
     bool tables_loaded_ = false;
 };
