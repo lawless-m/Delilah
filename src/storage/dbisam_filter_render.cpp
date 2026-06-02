@@ -31,7 +31,10 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 
 namespace duckdb {
@@ -181,6 +184,15 @@ std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
         out += ")";
         return out;
     }
+    case TableFilterType::OPTIONAL_FILTER: {
+        // DuckDB wraps several pushdown-eligible shapes in OPTIONAL_FILTER
+        // — observed live for multi-element IN-lists. The wrapper just
+        // says "DuckDB will fall back to its own evaluation if you skip
+        // this"; render the child if we can.
+        const auto &of = filter.Cast<OptionalFilter>();
+        if (!of.child_filter) return std::nullopt;
+        return RenderDbisamFilter(*of.child_filter, column_name);
+    }
     case TableFilterType::IN_FILTER: {
         const auto &inf = filter.Cast<InFilter>();
         if (inf.values.empty()) return std::nullopt;
@@ -215,15 +227,46 @@ std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
     }
 }
 
+// String form of TableFilterType for diagnostics. Just the cases we
+// recognise in the renderer; everything else falls through.
+static const char *FilterTypeName(TableFilterType t) {
+    switch (t) {
+    case TableFilterType::CONSTANT_COMPARISON: return "CONSTANT_COMPARISON";
+    case TableFilterType::IS_NULL:             return "IS_NULL";
+    case TableFilterType::IS_NOT_NULL:         return "IS_NOT_NULL";
+    case TableFilterType::CONJUNCTION_OR:      return "CONJUNCTION_OR";
+    case TableFilterType::CONJUNCTION_AND:     return "CONJUNCTION_AND";
+    case TableFilterType::STRUCT_EXTRACT:      return "STRUCT_EXTRACT";
+    case TableFilterType::OPTIONAL_FILTER:     return "OPTIONAL_FILTER";
+    case TableFilterType::IN_FILTER:           return "IN_FILTER";
+    case TableFilterType::DYNAMIC_FILTER:      return "DYNAMIC_FILTER";
+    case TableFilterType::EXPRESSION_FILTER:   return "EXPRESSION_FILTER";
+    case TableFilterType::BLOOM_FILTER:        return "BLOOM_FILTER";
+    default:                                   return "<unknown>";
+    }
+}
+
 std::string RenderDbisamFilterSet(const TableFilterSet &filters,
                                   const std::vector<std::string> &column_names,
                                   std::vector<idx_t> &applied) {
     std::string out;
+    bool debug = std::getenv("DBISAM_FILTER_DEBUG") != nullptr;
     for (auto &entry : filters.filters) {
         idx_t col_idx = entry.first;
+        if (debug) {
+            const char *colname = col_idx < column_names.size()
+                                      ? column_names[col_idx].c_str()
+                                      : "<oob>";
+            std::fprintf(stderr, "[dbisam-filter] col=%zu (%s) type=%s\n",
+                         col_idx, colname, FilterTypeName(entry.second->filter_type));
+        }
         if (col_idx >= column_names.size()) continue;
         auto rendered = RenderDbisamFilter(*entry.second, column_names[col_idx]);
-        if (!rendered) continue;
+        if (!rendered) {
+            if (debug) std::fprintf(stderr, "[dbisam-filter]   -> not rendered (unsupported shape)\n");
+            continue;
+        }
+        if (debug) std::fprintf(stderr, "[dbisam-filter]   -> %s\n", rendered->c_str());
         if (!out.empty()) out += " AND ";
         out += *rendered;
         applied.push_back(col_idx);
