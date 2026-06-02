@@ -12,6 +12,7 @@
 
 #include "dbisam/client.hpp"
 #include "dbisam/row.hpp"
+#include "dbisam/text.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/date.hpp"
@@ -135,13 +136,15 @@ static void write_cell(Vector &out, idx_t row, dbisam::FieldType ft,
     case FT::Memo:
     case FT::Calculated:
     case FT::Unknown: {
+        // DBISAM ftString/ftMemo are Windows-1252; decode to UTF-8 so
+        // the resulting VARCHAR is valid for downstream sinks (Parquet,
+        // Arrow, JSON). UTF-8-clean strings pass through unchanged.
         if (auto *s = std::get_if<std::string>(&cell)) {
-            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, *s);
+            auto u = dbisam::decode_dbisam_text(*s);
+            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, u);
         } else if (auto *bytes = std::get_if<std::vector<uint8_t>>(&cell)) {
-            // Memo resolved via OpenBlob arrives as raw bytes; treat as
-            // text for the VARCHAR mapping (DBISAM ftMemo is text).
-            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(
-                out, const_char_ptr_cast(bytes->data()), bytes->size());
+            auto u = dbisam::decode_dbisam_text(bytes->data(), bytes->size());
+            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, u);
         } else {
             FlatVector::SetNull(out, row, true);
         }

@@ -45,6 +45,7 @@ add_library(dbisam_protocol STATIC
     src/protocol/response.cpp
     src/protocol/cursor.cpp
     src/protocol/blob.cpp
+    src/protocol/text.cpp
     src/protocol/client.cpp
 )
 target_include_directories(dbisam_protocol

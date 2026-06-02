@@ -11,6 +11,7 @@
 
 #include "dbisam/cursor.hpp"
 #include "dbisam/row.hpp"
+#include "dbisam/text.hpp"
 
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/time.hpp"
@@ -224,11 +225,15 @@ static void WriteCell(Vector &out, idx_t row, dbisam::FieldType ft, const dbisam
     case FT::Memo:
     case FT::Calculated:
     case FT::Unknown: {
+        // DBISAM ftString/ftMemo are Windows-1252; decode to UTF-8 so
+        // the resulting VARCHAR is valid for downstream sinks (Parquet,
+        // Arrow, JSON). UTF-8-clean strings pass through unchanged.
         if (auto *s = std::get_if<std::string>(&cell)) {
-            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, *s);
+            auto u = dbisam::decode_dbisam_text(*s);
+            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, u);
         } else if (auto *b = std::get_if<std::vector<uint8_t>>(&cell)) {
-            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(
-                out, const_char_ptr_cast(b->data()), b->size());
+            auto u = dbisam::decode_dbisam_text(b->data(), b->size());
+            FlatVector::GetData<string_t>(out)[row] = StringVector::AddString(out, u);
         } else {
             FlatVector::SetNull(out, row, true);
         }
