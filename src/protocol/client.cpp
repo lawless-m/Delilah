@@ -246,138 +246,30 @@ std::vector<std::vector<CellValue>> Client::decode_batch_with_blobs(
     return decoded;
 }
 
+// Convenience wrapper that materialises the full result. The previous
+// implementation duplicated all the blob-resolution logic that lives
+// in decode_batch_with_blobs; this version drives the streaming path
+// to exhaustion, concatenating decoded batches. The CursorRunner's
+// destructor sends CloseCursor + ResetStatement +
+// RemoveAllRemoteMemoryTables when the StreamingScan goes out of scope.
+//
+// Callers that only need the schema should use query_raw + parse_schema
+// directly — that's one round-trip instead of the 5+ this does.
 Client::QueryResult Client::query_decoded(const std::string &sql, size_t target_rows) {
-    auto schema_resp = query_raw(sql);
-    auto [columns, _end] = parse_schema(schema_resp);
-
+    auto stream = start_streaming(sql);
     QueryResult out;
-    out.columns = columns;
-
+    out.columns = stream.columns;
     if (target_rows == 0) target_rows = SIZE_MAX;
-
-    size_t first_off = columns.front().row_offset;
-    const auto &last = columns.back();
-    size_t col_data_span = (last.row_offset - first_off) + 1 + last.max;
-    size_t col_end_off = first_off + col_data_span;
-
-    // Identify blob/memo/graphic columns up front for the row-pass loop.
-    std::vector<size_t> blob_col_indices;
-    for (size_t i = 0; i < columns.size(); ++i) {
-        auto ft = columns[i].field_type;
-        if (ft == FieldType::Blob || ft == FieldType::Memo || ft == FieldType::Graphic) {
-            blob_col_indices.push_back(i);
+    while (out.rows.size() < target_rows) {
+        auto block = stream.runner->next_block();
+        if (block.rows.empty() && block.eoc) break;
+        auto decoded = decode_batch_with_blobs(out.columns, block.rows, block.bookmarks);
+        for (auto &row : decoded) {
+            if (out.rows.size() >= target_rows) break;
+            out.rows.push_back(std::move(row));
         }
+        if (block.eoc) break;
     }
-    size_t pk_field_width = columns.front().max;
-
-    // Deferred blob fetches captured during the cursor pass. Resolved
-    // AFTER drive_cursor finishes — the cursor stays open through cleanup,
-    // so handles remain valid.
-    struct BlobTask {
-        size_t row_idx;
-        size_t col_idx;
-        std::array<uint8_t, 16> md5;
-        std::vector<uint8_t> pk_field;
-        uint32_t phys;
-    };
-    std::vector<BlobTask> blob_tasks;
-
-    drive_cursor(transport_, columns, target_rows, batch_size_, compression_,
-                 [&](const uint8_t *row, size_t row_len,
-                     const uint8_t *bm, size_t bmlen) {
-        if (row_len < col_end_off) return true;
-        std::vector<CellValue> cells;
-        try {
-            cells = decode_record(row + first_off, col_data_span, columns);
-        } catch (const std::exception &) {
-            return true; // skip individual bad rows
-        }
-
-        // For each blob column with a non-zero handle, capture a task
-        // and replace the cell with NullValue as a placeholder.
-        for (size_t ci : blob_col_indices) {
-            if (auto *h = std::get_if<BlobHandle>(&cells[ci])) {
-                bool all_zero = true;
-                for (uint8_t b : h->bytes) {
-                    if (b != 0) { all_zero = false; break; }
-                }
-                if (!all_zero
-                    && row_len >= 25
-                    && row_len >= first_off + 1 + pk_field_width) {
-                    BlobTask t;
-                    t.row_idx = out.rows.size();
-                    t.col_idx = ci;
-                    std::memcpy(t.md5.data(), row + 9, 16);
-                    t.pk_field.assign(row + first_off + 1,
-                                      row + first_off + 1 + pk_field_width);
-                    t.phys = physical_record_number_from_bookmark(bm, bmlen);
-                    if (std::getenv("DBISAM_BLOB_DEBUG") && blob_tasks.size() < 3) {
-                        std::fprintf(stderr, "[em-blob] capture row %zu col %zu: bmlen=%zu bm=",
-                                     out.rows.size(), ci, bmlen);
-                        for (size_t k = 0; k < bmlen && k < 32; ++k) {
-                            std::fprintf(stderr, "%02x", bm[k]);
-                        }
-                        std::fprintf(stderr, "\n");
-                    }
-                    blob_tasks.push_back(std::move(t));
-                }
-                cells[ci] = NullValue{};
-            }
-        }
-
-        out.rows.push_back(std::move(cells));
-        return true;
-    });
-
-    // Resolve deferred blob fetches while the cursor is still open.
-    size_t effective_slot_length = blob_slot_length_;
-    constexpr size_t FLUSH_EVERY = 50;
-    bool blob_debug = std::getenv("DBISAM_BLOB_DEBUG") != nullptr;
-    if (blob_debug) {
-        std::fprintf(stderr, "[em-blob] %zu blob tasks; %zu blob columns; pk_width=%zu\n",
-                     blob_tasks.size(), blob_col_indices.size(), pk_field_width);
-    }
-    for (size_t i = 0; i < blob_tasks.size(); ++i) {
-        if (i > 0 && i % FLUSH_EVERY == 0) {
-            (void)transport_.send_recv_auto(build_free_all_blobs(1, 0), compression_);
-        }
-        const auto &task = blob_tasks[i];
-        try {
-            auto slot = build_slot(task.phys, task.md5, task.pk_field, effective_slot_length);
-            auto outcome = fetch_blob(transport_, compression_, 1,
-                                      static_cast<uint16_t>(task.col_idx + 1), slot);
-            if (blob_debug) {
-                std::fprintf(stderr, "[em-blob] task %zu (row=%zu col=%zu phys=%u): payload=%zu bytes, slot_echo=%zu\n",
-                             i, task.row_idx, task.col_idx, task.phys,
-                             outcome.payload.size(), outcome.actual_slot_length);
-            }
-            if (outcome.actual_slot_length != effective_slot_length) {
-                effective_slot_length = outcome.actual_slot_length;
-                slot = build_slot(task.phys, task.md5, task.pk_field, effective_slot_length);
-                outcome = fetch_blob(transport_, compression_, 1,
-                                     static_cast<uint16_t>(task.col_idx + 1), slot);
-                if (blob_debug) {
-                    std::fprintf(stderr, "[em-blob]   retry: payload=%zu bytes, slot_echo=%zu\n",
-                                 outcome.payload.size(), outcome.actual_slot_length);
-                }
-            }
-            out.rows[task.row_idx][task.col_idx] = std::move(outcome.payload);
-            (void)transport_.send_recv_auto(
-                build_free_blob(1, static_cast<uint16_t>(task.col_idx + 1),
-                                outcome.slot_echo.data(), outcome.slot_echo.size(), 0),
-                compression_);
-        } catch (const std::exception &e) {
-            if (blob_debug) {
-                std::fprintf(stderr, "[em-blob] task %zu FAIL: %s\n", i, e.what());
-            }
-        }
-    }
-
-    // Cleanup: close cursor, reset statement, release server-side temp tables.
-    (void)transport_.send_recv_auto(build_close_cursor(1), compression_);
-    (void)transport_.send_recv_auto(build_reset_statement(1), compression_);
-    (void)transport_.send_recv_auto(build_remove_all_remote_memory_tables(), compression_);
-
     return out;
 }
 

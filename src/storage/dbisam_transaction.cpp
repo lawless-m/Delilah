@@ -69,19 +69,22 @@ optional_ptr<CatalogEntry> DbisamTransaction::GetCatalogEntry(const std::string 
     }
 
     // Schema probe — `SELECT * FROM "<tbl>" WHERE 1=0` returns the
-    // schema response without driving the cursor. Double-quoted
-    // identifiers are accepted per the Dibdog grammar (`identifier//1`
-    // production), which keeps mixed-case/special-char table names
-    // safe even though DBISAM bare-identifier matching is otherwise
-    // case-insensitive.
+    // schema response. PrepareStatement alone carries the schema
+    // blocks; no need to drive the cursor for a row-less result, so
+    // query_raw + parse_schema is one round-trip vs ~5 for the
+    // full query_decoded path. Double-quoted identifiers are
+    // accepted per the Dibdog grammar (`identifier//1` production),
+    // keeping mixed-case / special-char table names safe.
     //
     // Fresh connection per probe — the native protocol desyncs when
     // multiple queries share a session.
     std::string probe = "SELECT * FROM \"" + name + "\" WHERE 1=0";
-    dbisam::Client::QueryResult q;
+    std::vector<dbisam::Column> columns;
     try {
         auto client = OpenClient();
-        q = client.query_decoded(probe, 0);
+        auto resp = client.query_raw(probe);
+        auto [cols, _end] = dbisam::parse_schema(resp);
+        columns = std::move(cols);
     } catch (const std::exception &) {
         // Treat as "table doesn't exist" — let DuckDB surface a clean
         // "table not found" rather than a wire-protocol error.
@@ -90,8 +93,8 @@ optional_ptr<CatalogEntry> DbisamTransaction::GetCatalogEntry(const std::string 
 
     CreateTableInfo info(catalog_.GetMainSchema(), name);
     std::vector<dbisam::FieldType> field_types;
-    field_types.reserve(q.columns.size());
-    for (const auto &col : q.columns) {
+    field_types.reserve(columns.size());
+    for (const auto &col : columns) {
         info.columns.AddColumn(ColumnDefinition(col.name, MapFieldType(col.field_type)));
         field_types.push_back(col.field_type);
     }
