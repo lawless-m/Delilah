@@ -60,6 +60,7 @@ set(EXTENSION_SOURCES
     src/dbisam_storage.cpp
     src/storage/dbisam_attach_options.cpp
     src/storage/dbisam_catalog.cpp
+    src/storage/dbisam_filter_render.cpp
     src/storage/dbisam_schema_entry.cpp
     src/storage/dbisam_table_entry.cpp
     src/storage/dbisam_transaction.cpp

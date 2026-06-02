@@ -6,6 +6,7 @@
 
 #include "dbisam/storage/dbisam_table_entry.hpp"
 #include "dbisam/storage/dbisam_catalog.hpp"
+#include "dbisam/storage/dbisam_filter_render.hpp"
 #include "dbisam/storage/dbisam_transaction.hpp"
 
 #include "dbisam/row.hpp"
@@ -17,6 +18,8 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <variant>
 
 namespace duckdb {
@@ -126,6 +129,30 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
     }
     sql += " FROM " + QuoteIdent(bind.table->name);
 
+    // Filter pushdown: TableFilterSet's column_ids are indices into the
+    // SCAN'S column_ids (i.e. into the projected columns), not into the
+    // table's full column list. Resolve each to the real column name via
+    // bind.all_names[column_ids[col_idx]] before rendering.
+    if (input.filters) {
+        std::vector<std::string> filter_col_names;
+        filter_col_names.reserve(state->column_ids.size());
+        for (auto cid : state->column_ids) {
+            if (cid < bind.all_names.size()) {
+                filter_col_names.push_back(bind.all_names[cid]);
+            } else {
+                filter_col_names.emplace_back(); // ROWID etc — no name
+            }
+        }
+        std::vector<idx_t> applied;
+        std::string where = RenderDbisamFilterSet(*input.filters, filter_col_names, applied);
+        if (!where.empty()) {
+            sql += " WHERE " + where;
+        }
+    }
+
+    if (std::getenv("DBISAM_SQL_DEBUG")) {
+        std::fprintf(stderr, "[dbisam-sql] %s\n", sql.c_str());
+    }
     // Fresh Client per scan — native protocol desyncs when multiple
     // queries share a session (per ExportKing README).
     auto &txn = DbisamTransaction::Get(context, bind.table->catalog);
@@ -267,6 +294,10 @@ TableFunction DbisamTableEntry::GetScanFunction(ClientContext &, unique_ptr<Func
                      DbisamAttachedScanExecute, DbisamAttachedScanBind,
                      DbisamAttachedScanInitGlobal);
     tf.projection_pushdown = true;
+    tf.filter_pushdown = true;
+    // filter_prune left at default (false) — DuckDB still post-filters
+    // even when we push down, so any unsupported filter shapes we
+    // silently dropped get evaluated correctly on the DuckDB side.
 
     // Pre-populate bind_data so the planner can request statistics etc.
     // before re-binding. The actual bind callback re-derives the same
