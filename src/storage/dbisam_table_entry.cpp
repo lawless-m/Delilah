@@ -198,6 +198,15 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
         }
     }
 
+    // Hard server-side row cap. When the LIMIT was pushed with no residual
+    // filter, append DBISAM's trailing `TOP n` so the server stops
+    // preparing the result after n rows instead of materialising the whole
+    // table first — without this, `... LIMIT 5` on a large table waits for
+    // the full server-side prepare. Trailing clause, after WHERE.
+    if (bind.limit_hint > 0 && bind.limit_hard_cap) {
+        sql += " TOP " + std::to_string(bind.limit_hint);
+    }
+
     if (std::getenv("DBISAM_SQL_DEBUG")) {
         std::fprintf(stderr, "[dbisam-sql] %s\n", sql.c_str());
     }

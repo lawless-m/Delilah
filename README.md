@@ -115,7 +115,7 @@ table count (~15 s for ~600 tables); subsequent access is instant.
 |--------------------------|-----------------------------------------------------------------------------|
 | Projection pushdown      | Only the requested columns travel over the wire.                            |
 | `WHERE` filter pushdown  | `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`, `IS [NOT] NULL`, AND/OR, LIKE-prefix.|
-| `LIMIT n` pushdown       | First server batch is sized `n` (+ OFFSET) so the fetch stops early.        |
+| `LIMIT n` pushdown       | Emits a trailing DBISAM `TOP n` so the server caps early (no full prepare); falls back to first-batch sizing when a non-pushable filter sits above the scan. |
 | Streaming scan           | Bounded memory; no whole-table materialisation in the extension.            |
 | BLOB / Memo columns      | Auto-resolved per row via `OpenBlob` / `FreeBlob`, PK auto-injected.        |
 | `COPY (…) TO 'x.parquet'`| Win-1252 → UTF-8 transcoded at the boundary; parquet readback is clean.     |

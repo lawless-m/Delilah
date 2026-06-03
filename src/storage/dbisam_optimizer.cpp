@@ -31,7 +31,11 @@ namespace {
 
 // Walk down through pass-through operators looking for the dbisam_attached_scan
 // LogicalGet. Returns nullptr if the chain is broken by an unfriendly op.
-DbisamAttachedScanBindData *find_attached_scan_bind(LogicalOperator &op) {
+// Sets `saw_filter` if a LOGICAL_FILTER (a residual predicate applied AFTER
+// the scan) sits between the LIMIT and the GET — in which case the limit may
+// NOT be emitted as a hard server-side TOP (it would discard rows DuckDB
+// still needs post-filter).
+DbisamAttachedScanBindData *find_attached_scan_bind(LogicalOperator &op, bool &saw_filter) {
     if (op.type == LogicalOperatorType::LOGICAL_GET) {
         auto &get = op.Cast<LogicalGet>();
         if (get.function.name == "dbisam_attached_scan" && get.bind_data) {
@@ -41,8 +45,11 @@ DbisamAttachedScanBindData *find_attached_scan_bind(LogicalOperator &op) {
     }
     if (op.type == LogicalOperatorType::LOGICAL_PROJECTION
         || op.type == LogicalOperatorType::LOGICAL_FILTER) {
+        if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+            saw_filter = true;
+        }
         if (!op.children.empty()) {
-            return find_attached_scan_bind(*op.children[0]);
+            return find_attached_scan_bind(*op.children[0], saw_filter);
         }
     }
     return nullptr;
@@ -60,15 +67,20 @@ void walk(LogicalOperator &op) {
             // Cap is limit+offset because we need to fetch enough rows
             // for DuckDB to discard `offset` and emit `n`.
             idx_t cap = n + offset;
-            if (auto *bind = find_attached_scan_bind(*op.children[0])) {
+            bool saw_filter = false;
+            if (auto *bind = find_attached_scan_bind(*op.children[0], saw_filter)) {
                 // Only LOWER a previously-set hint; never raise it
                 // (e.g. nested LIMITs in subqueries).
                 if (bind->limit_hint == 0 || cap < bind->limit_hint) {
                     bind->limit_hint = cap;
+                    // Hard server-side TOP is safe only with no residual
+                    // filter between this LIMIT and the scan.
+                    bind->limit_hard_cap = !saw_filter;
                     if (std::getenv("DBISAM_SQL_DEBUG")) {
                         std::fprintf(stderr,
-                                     "[dbisam-opt] LIMIT %zu pushed into dbisam_attached_scan bind\n",
-                                     static_cast<size_t>(cap));
+                                     "[dbisam-opt] LIMIT %zu pushed into dbisam_attached_scan bind%s\n",
+                                     static_cast<size_t>(cap),
+                                     bind->limit_hard_cap ? " (hard TOP)" : " (batch-size only)");
                     }
                 }
             }
