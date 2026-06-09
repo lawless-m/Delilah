@@ -39,13 +39,11 @@
 
 namespace duckdb {
 
-namespace {
-
 // Per MrsFlow Dbisam dialect: bare for `[a-zA-Z_][a-zA-Z0-9_]*`, else
 // double-quoted with embedded `"` doubled. We always emit quoted form
 // for safety — Dibdog grammar accepts both, and bare-vs-quoted is
 // semantically identical in this position.
-std::string QuoteIdent(const std::string &name) {
+std::string QuoteDbisamIdent(const std::string &name) {
     std::string out;
     out.reserve(name.size() + 2);
     out.push_back('"');
@@ -56,6 +54,8 @@ std::string QuoteIdent(const std::string &name) {
     out.push_back('"');
     return out;
 }
+
+namespace {
 
 std::string QuoteText(const std::string &s) {
     std::string out;
@@ -151,7 +151,7 @@ std::optional<const char *> ComparisonOp(ExpressionType t) {
 
 std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
                                               const std::string &column_name) {
-    auto qcol = QuoteIdent(column_name);
+    auto qcol = QuoteDbisamIdent(column_name);
     switch (filter.filter_type) {
     case TableFilterType::IS_NULL:
         return qcol + " IS NULL";

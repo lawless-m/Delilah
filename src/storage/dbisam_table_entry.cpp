@@ -98,20 +98,6 @@ static bool IsBlobShaped(dbisam::FieldType ft) {
         || ft == dbisam::FieldType::Graphic;
 }
 
-// Quote an identifier per the DBISAM/Dibdog grammar — double quotes,
-// embedded `"` doubled. Mixed-case and DBISAM-reserved names safely
-// pass through this form.
-static std::string QuoteIdent(const std::string &name) {
-    std::string out = "\"";
-    out.reserve(name.size() + 2);
-    for (char c : name) {
-        out += c;
-        if (c == '"') out += '"';
-    }
-    out += '"';
-    return out;
-}
-
 static unique_ptr<GlobalTableFunctionState>
 DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind = input.bind_data->CastNoConst<DbisamScanBindData>();
@@ -132,12 +118,20 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
             break;
         }
     }
-    // Don't double-add if the user already projected column 0.
-    bool pk_already_in_projection = false;
+    // The blob resolver requires the PK at SELECT *position 0*
+    // (decode_batch_with_blobs reads columns.front()), so membership of
+    // column 0 elsewhere in the projection isn't enough — it must be the
+    // first real column. Otherwise inject it at position 0 (a duplicate
+    // SELECT entry if it also appears later is harmless).
+    bool pk_leads_projection = false;
     for (auto cid : state->column_ids) {
-        if (cid == 0) { pk_already_in_projection = true; break; }
+        if (cid == COLUMN_IDENTIFIER_ROW_ID || cid >= bind.all_names.size()) {
+            continue; // rowid pseudo-columns don't appear in the SELECT
+        }
+        pk_leads_projection = (cid == 0);
+        break;
     }
-    bool pk_injected = needs_pk && !pk_already_in_projection && !bind.all_names.empty();
+    bool pk_injected = needs_pk && !pk_leads_projection && !bind.all_names.empty();
 
     // Two passes through column_ids:
     //   (a) build the SELECT — real columns only, in the order they
@@ -149,7 +143,7 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
     // is BIGINT and we just emit sequential row indices into it.
     std::vector<std::string> select_cols;
     if (pk_injected) {
-        select_cols.push_back(QuoteIdent(bind.all_names[0]));
+        select_cols.push_back(QuoteDbisamIdent(bind.all_names[0]));
     }
     state->output_to_projected.reserve(state->column_ids.size());
     for (auto cid : state->column_ids) {
@@ -158,7 +152,7 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
             continue;
         }
         state->output_to_projected.push_back(select_cols.size());
-        select_cols.push_back(QuoteIdent(bind.all_names[cid]));
+        select_cols.push_back(QuoteDbisamIdent(bind.all_names[cid]));
     }
     // Always need at least one real column to drive the cursor and get
     // a row count. Pick column 0 if the request was rowid-only.
@@ -167,7 +161,7 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
         if (bind.all_names.empty()) {
             return std::move(state);
         }
-        select_cols.push_back(QuoteIdent(bind.all_names[0]));
+        select_cols.push_back(QuoteDbisamIdent(bind.all_names[0]));
     }
 
     std::string sql = "SELECT ";
@@ -175,7 +169,7 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
         if (i) sql += ", ";
         sql += select_cols[i];
     }
-    sql += " FROM " + QuoteIdent(bind.table->name);
+    sql += " FROM " + QuoteDbisamIdent(bind.table->name);
 
     // Filter pushdown: TableFilterSet's column_ids are indices into the
     // SCAN'S column_ids (i.e. into the projected columns), not into the

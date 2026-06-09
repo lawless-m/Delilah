@@ -99,17 +99,23 @@ static void compression_defaults_to_true() {
     CHECK(o.compression == true);
 }
 
-static void password_with_at_sign_only_first_splits() {
-    // First @ separates userinfo from hostpath. Subsequent @s belong to
-    // the path. We don't try to handle @ in passwords (would need URL
-    // encoding); document via this test that it goes into hostpath.
-    auto o = parse_attach_path("em://u:p@@host/cat");
+static void password_with_at_sign() {
+    // Last @ separates userinfo from hostpath (URL convention), so a
+    // password containing @ parses correctly.
+    auto o = parse_attach_path("em://u:p@ss@host/cat");
     CHECK(o.user == "u");
-    CHECK(o.password == "p"); // split at first :
-    // hostpath = "@host/cat" → host_only = "@host", catalog = "cat"
-    // (this would never actually connect — test documents the parser's
-    // greedy first-@ behaviour)
-    CHECK(o.host == "@host");
+    CHECK(o.password == "p@ss");
+    CHECK(o.host == "host");
+    CHECK(o.catalog == "cat");
+}
+
+static void password_with_colon() {
+    // Userinfo splits at the FIRST colon, so colons in the password
+    // survive (usernames can't contain ':').
+    auto o = parse_attach_path("em://u:p:wd@host/cat");
+    CHECK(o.user == "u");
+    CHECK(o.password == "p:wd");
+    CHECK(o.host == "host");
     CHECK(o.catalog == "cat");
 }
 
@@ -124,7 +130,8 @@ int main() {
     bad_port_throws();
     encrypt_password_defaults_to_elevatesoft();
     compression_defaults_to_true();
-    password_with_at_sign_only_first_splits();
+    password_with_at_sign();
+    password_with_colon();
     if (g_failures == 0) {
         std::printf("all attach-options tests passed\n");
         return 0;

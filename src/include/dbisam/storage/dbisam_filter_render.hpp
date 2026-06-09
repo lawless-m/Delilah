@@ -20,6 +20,12 @@
 
 namespace duckdb {
 
+// Quote an identifier per the DBISAM/Dibdog grammar — double quotes,
+// embedded `"` doubled. Mixed-case and DBISAM-reserved names safely
+// pass through this form. Shared by the filter renderer, the attached
+// scan's SELECT builder, and the catalog's schema probe.
+std::string QuoteDbisamIdent(const std::string &name);
+
 // Render one filter as a DBISAM WHERE fragment over `column_name`.
 // Returns std::nullopt if we can't represent it safely.
 std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,

@@ -32,9 +32,10 @@ ConnOpts parse_attach_path(const std::string &path) {
         rest = rest.substr(5);
     }
 
-    // Split userinfo (if present) from host/catalog.
+    // Split userinfo (if present) from host/catalog. Last '@' per URL
+    // convention, so passwords containing '@' parse correctly.
     std::string userinfo, hostpath;
-    auto at = rest.find('@');
+    auto at = rest.rfind('@');
     if (at != std::string::npos) {
         userinfo = rest.substr(0, at);
         hostpath = rest.substr(at + 1);
