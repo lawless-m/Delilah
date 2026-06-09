@@ -58,6 +58,17 @@ bool socket_was_interrupted() {
     return ::WSAGetLastError() == WSAEINTR;
 }
 
+int socket_wait_writable(socket_t s, int timeout_ms) {
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(s, &wfds);
+    timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    // Windows ignores the nfds parameter.
+    return ::select(0, nullptr, &wfds, nullptr, &tv);
+}
+
 #else // POSIX
 
 void ensure_wsa_started() {
@@ -92,6 +103,14 @@ bool socket_would_block() {
 
 bool socket_was_interrupted() {
     return errno == EINTR;
+}
+
+int socket_wait_writable(socket_t s, int timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd = s;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    return ::poll(&pfd, 1, timeout_ms);
 }
 
 #endif

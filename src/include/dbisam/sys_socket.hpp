@@ -21,6 +21,7 @@
     #include <fcntl.h>
     #include <netdb.h>
     #include <netinet/in.h>
+    #include <poll.h>
     #include <sys/socket.h>
     #include <sys/time.h>
     #include <unistd.h>
@@ -65,5 +66,11 @@ bool socket_would_block();
 // Interrupted-by-signal check (EINTR / WSAEINTR). Mostly a no-op on
 // Windows in practice but kept for symmetry.
 bool socket_was_interrupted();
+
+// Wait until `s` becomes writable (a non-blocking connect completing)
+// or `timeout_ms` elapses. Returns >0 on writable, 0 on timeout, <0 on
+// error. poll() on POSIX (select() is UB for fd >= FD_SETSIZE);
+// select() on Windows where fd_set is an array of SOCKETs.
+int socket_wait_writable(socket_t s, int timeout_ms);
 
 } // namespace dbisam

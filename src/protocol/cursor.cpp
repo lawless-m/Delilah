@@ -147,33 +147,44 @@ CursorRunner::CursorRunner(Transport &transport, std::vector<Column> columns,
     auto r = transport_.send_recv_auto(build_execute_statement(CURSOR_HANDLE), compression_);
     opened_ = true; // ExecuteStatement was sent — server has cursor state to clean up
 
-    size_t polls = 0;
-    for (;;) {
-        bool sentinel = body_reqcode(r) == REQCODE_POLLING_SENTINEL;
-        bool inner_not_ready = inner_says_not_ready(r);
-        if (!sentinel && !inner_not_ready) break;
-        if (++polls >= MAX_RECEIVE_POLLS) {
-            throw std::runtime_error("cursor still 'not ready' after " +
-                                     std::to_string(MAX_RECEIVE_POLLS) + " Receive polls");
+    // A throwing constructor never gets its destructor run, so the
+    // server-side cursor must be released here on the error path.
+    try {
+        size_t polls = 0;
+        for (;;) {
+            bool sentinel = body_reqcode(r) == REQCODE_POLLING_SENTINEL;
+            bool inner_not_ready = inner_says_not_ready(r);
+            if (!sentinel && !inner_not_ready) break;
+            if (++polls >= MAX_RECEIVE_POLLS) {
+                throw std::runtime_error("cursor still 'not ready' after " +
+                                         std::to_string(MAX_RECEIVE_POLLS) + " Receive polls");
+            }
+            r = transport_.send_recv_auto(build_receive(), compression_);
         }
-        r = transport_.send_recv_auto(build_receive(), compression_);
-    }
 
-    // SetToBegin — response is consumed but not used (rows come from
-    // ReadFirstRecordBlock).
-    (void)transport_.send_recv_auto(build_set_to_begin(CURSOR_HANDLE), compression_);
+        // SetToBegin — response is consumed but not used (rows come from
+        // ReadFirstRecordBlock).
+        (void)transport_.send_recv_auto(build_set_to_begin(CURSOR_HANDLE), compression_);
+    } catch (...) {
+        cleanup_server_cursor();
+        throw;
+    }
 }
 
-CursorRunner::~CursorRunner() {
-    if (!opened_) return;
-    // Best-effort cleanup — destruction can run on the error path so
-    // we don't want any send/recv exception to escape.
+void CursorRunner::cleanup_server_cursor() noexcept {
+    // Best-effort cleanup — this runs on error paths too, so no
+    // send/recv exception may escape.
     try { (void)transport_.send_recv_auto(build_close_cursor(CURSOR_HANDLE), compression_); }
     catch (...) {}
     try { (void)transport_.send_recv_auto(build_reset_statement(CURSOR_HANDLE), compression_); }
     catch (...) {}
     try { (void)transport_.send_recv_auto(build_remove_all_remote_memory_tables(), compression_); }
     catch (...) {}
+}
+
+CursorRunner::~CursorRunner() {
+    if (!opened_) return;
+    cleanup_server_cursor();
 }
 
 CursorRunner::Block CursorRunner::next_block() {
@@ -201,14 +212,11 @@ CursorRunner::Block CursorRunner::next_block() {
     }
 
     Walker walker(response_.data(), response_.size(), PACK_STREAM_OFFSET);
-    std::optional<CursorBatch> batch;
-    try {
-        batch = read_record_block_batch(walker, record_size_);
-    } catch (const std::exception &) {
-        eoc_ = true;
-        out.eoc = true;
-        return out;
-    }
+    // A malformed mid-stream response is a protocol error, not
+    // end-of-cursor — swallowing it here would silently truncate the
+    // result set. Let WireError propagate; only a cleanly-empty Pack
+    // stream (nullopt) means the server has nothing more for us.
+    auto batch = read_record_block_batch(walker, record_size_);
     if (!batch) {
         eoc_ = true;
         out.eoc = true;

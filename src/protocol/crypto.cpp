@@ -3,11 +3,18 @@
 #include "blowfish.hpp"
 #include "md5.hpp"
 
+#include <stdexcept>
+
 namespace dbisam {
 
 std::vector<uint8_t> encrypt_login(const uint8_t *username, size_t ulen,
                                    const uint8_t *password, size_t plen,
                                    const uint8_t *encrypt_password, size_t elen) {
+    // Lengths are single-byte prefixes in the plaintext; anything longer
+    // would truncate silently and log in as the wrong user.
+    if (ulen > 255 || plen > 255) {
+        throw std::invalid_argument("encrypt_login: username/password longer than 255 bytes");
+    }
     std::vector<uint8_t> pt;
     pt.reserve(2 + ulen + plen + 8);
     pt.push_back(static_cast<uint8_t>(ulen));
