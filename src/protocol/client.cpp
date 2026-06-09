@@ -175,17 +175,30 @@ std::vector<std::vector<CellValue>> Client::decode_batch_with_blobs(
 
     std::vector<std::vector<CellValue>> decoded;
     decoded.reserve(rows.size());
+    size_t malformed_rows = 0;
     for (size_t i = 0; i < rows.size(); ++i) {
         const uint8_t *row = rows[i].first;
         size_t row_len = rows[i].second;
         if (row_len < col_end_off) {
-            decoded.emplace_back(); // skip malformed
+            if (!lenient_decode_) {
+                throw RowError("row " + std::to_string(i) + " truncated: " +
+                               std::to_string(row_len) + " bytes, need " +
+                               std::to_string(col_end_off) +
+                               " (set LENIENT_DECODE to emit NULLs instead)");
+            }
+            ++malformed_rows;
+            decoded.emplace_back(); // emitted downstream as all-NULL
             continue;
         }
         std::vector<CellValue> cells;
         try {
             cells = decode_record(row + first_off, col_data_span, columns);
-        } catch (const std::exception &) {
+        } catch (const std::exception &e) {
+            if (!lenient_decode_) {
+                throw RowError("row " + std::to_string(i) + " failed to decode: " +
+                               e.what() + " (set LENIENT_DECODE to emit NULLs instead)");
+            }
+            ++malformed_rows;
             decoded.emplace_back();
             continue;
         }
@@ -216,6 +229,7 @@ std::vector<std::vector<CellValue>> Client::decode_batch_with_blobs(
     size_t effective_slot_length = blob_slot_length_;
     constexpr size_t FLUSH_EVERY = 50;
     bool blob_debug = std::getenv("DBISAM_BLOB_DEBUG") != nullptr;
+    size_t blob_failures = 0;
     for (size_t i = 0; i < blob_tasks.size(); ++i) {
         if (i > 0 && i % FLUSH_EVERY == 0) {
             (void)transport_.send_recv_auto(build_free_all_blobs(1, 0), compression_);
@@ -237,12 +251,25 @@ std::vector<std::vector<CellValue>> Client::decode_batch_with_blobs(
                                 outcome.slot_echo.data(), outcome.slot_echo.size(), 0),
                 compression_);
         } catch (const std::exception &e) {
+            if (!lenient_decode_) {
+                throw RowError("blob fetch failed for column " +
+                               columns[task.col_idx].name + " (phys record " +
+                               std::to_string(task.phys) + "): " + e.what() +
+                               " (set LENIENT_DECODE to emit NULLs instead)");
+            }
+            ++blob_failures;
             if (blob_debug) {
                 std::fprintf(stderr, "[em-blob] task %zu FAIL: %s\n", i, e.what());
             }
         }
     }
 
+    if (malformed_rows > 0 || blob_failures > 0) {
+        std::fprintf(stderr,
+                     "[dbisam] warning: lenient decode emitted NULLs for %zu malformed row(s) "
+                     "and %zu failed blob fetch(es) in this batch\n",
+                     malformed_rows, blob_failures);
+    }
     return decoded;
 }
 
@@ -356,7 +383,8 @@ Client Client::connect_and_login(const ConnOpts &opts) {
     std::vector<uint8_t> post(SESSION_SETUP_POST, SESSION_SETUP_POST + sizeof(SESSION_SETUP_POST));
     (void)t.send_recv_auto(post, opts.compression);
 
-    return Client(std::move(t), opts.compression, opts.batch_size, opts.blob_slot_length);
+    bool lenient = opts.lenient_decode || std::getenv("DBISAM_LENIENT_DECODE") != nullptr;
+    return Client(std::move(t), opts.compression, opts.batch_size, opts.blob_slot_length, lenient);
 }
 
 } // namespace dbisam

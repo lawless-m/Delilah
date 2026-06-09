@@ -31,6 +31,8 @@ unique_ptr<Catalog> DbisamAttach(optional_ptr<StorageExtensionInfo>, ClientConte
             opts.compression = entry.second.GetValue<bool>();
         } else if (StringUtil::CIEquals(entry.first, "eager_schema")) {
             opts.eager_schema = entry.second.GetValue<bool>();
+        } else if (StringUtil::CIEquals(entry.first, "lenient_decode")) {
+            opts.lenient_decode = entry.second.GetValue<bool>();
         } else {
             throw NotImplementedException("Unsupported parameter for DBISAM Attach: %s", entry.first);
         }

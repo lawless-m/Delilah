@@ -109,6 +109,10 @@ static unique_ptr<FunctionData> DbisamScanBind(ClientContext &ctx,
     if (it != input.named_parameters.end() && !it->second.IsNull()) {
         bind->opts.compression = it->second.GetValue<bool>();
     }
+    it = input.named_parameters.find("lenient_decode");
+    if (it != input.named_parameters.end() && !it->second.IsNull()) {
+        bind->opts.lenient_decode = it->second.GetValue<bool>();
+    }
     // Optional explicit DBISAM TOP-n cap. The SQL goes verbatim to the
     // server; appending `TOP n` here lets the server stop early instead
     // of streaming-with-early-termination on our side. Users who write
@@ -154,10 +158,22 @@ static unique_ptr<GlobalTableFunctionState> DbisamScanInitGlobal(ClientContext &
             dbisam::Client::connect_and_login(bind.opts));
         auto scan = state->client->start_streaming(bind.sql);
         state->cursor = std::move(scan.runner);
-        // The streaming-time schema should match the bind-time probe,
-        // but use the runner's columns (they reflect any per-call
-        // differences the server might emit).
-        bind.columns = std::move(scan.columns);
+        // The output vectors were typed from the bind-time probe. If the
+        // scan-time schema diverged (table altered between bind and
+        // execute), writing cells through the new field types into
+        // vectors allocated for the old ones would corrupt memory —
+        // fail loudly instead.
+        if (scan.columns.size() != bind.columns.size()) {
+            throw std::runtime_error("schema changed between bind and scan: " +
+                                     std::to_string(bind.columns.size()) + " columns at bind, " +
+                                     std::to_string(scan.columns.size()) + " at scan");
+        }
+        for (size_t i = 0; i < scan.columns.size(); ++i) {
+            if (scan.columns[i].field_type != bind.columns[i].field_type) {
+                throw std::runtime_error("schema changed between bind and scan: column " +
+                                         scan.columns[i].name + " changed type");
+            }
+        }
     } catch (const std::exception &e) {
         throw IOException("dbisam_scan: %s", e.what());
     }
@@ -313,6 +329,7 @@ void RegisterDbisamScan(ExtensionLoader &loader) {
     tf.named_parameters["encrypt_password"] = LogicalType::VARCHAR;
     tf.named_parameters["port"] = LogicalType::INTEGER;
     tf.named_parameters["compression"] = LogicalType::BOOLEAN;
+    tf.named_parameters["lenient_decode"] = LogicalType::BOOLEAN;
     tf.named_parameters["top"] = LogicalType::BIGINT;
     loader.RegisterFunction(tf);
 }
