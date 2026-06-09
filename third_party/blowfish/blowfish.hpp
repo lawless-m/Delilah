@@ -5,8 +5,9 @@
 // the algorithm's author. The implementation here is a clean-room port
 // based on Paul Kocher's widely-vendored public-domain C reference.
 //
-// We expose only ECB block encryption (one direction). Higher layers add
-// CBC chaining on top.
+// We expose ECB block encryption (used by the login path) plus
+// decryption (used by tests to round-trip-verify the CBC layer).
+// Higher layers add CBC chaining on top.
 
 #pragma once
 
@@ -25,5 +26,8 @@ void key_setup(Context &ctx, const uint8_t *key, size_t key_len);
 
 // Encrypt one 8-byte block in place (big-endian on the wire).
 void encrypt_block(const Context &ctx, uint8_t block[8]);
+
+// Decrypt one 8-byte block in place.
+void decrypt_block(const Context &ctx, uint8_t block[8]);
 
 } // namespace dbisam_blowfish

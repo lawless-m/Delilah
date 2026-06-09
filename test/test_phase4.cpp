@@ -34,10 +34,10 @@ static uint32_t read_u32_le(const std::vector<uint8_t> &b, size_t off) {
 }
 
 static void login_body_wraps_ciphertext() {
-    // Use the §5 worked-example ciphertext for a real-world byte sequence.
+    // 1 + 8 + 1 + 12 = 22 bytes plaintext → 24-byte ciphertext.
     auto ct = encrypt_login(
-        reinterpret_cast<const uint8_t *>("YOURUSER"), 6,
-        reinterpret_cast<const uint8_t *>("YOURPASSWORD"), 9,
+        reinterpret_cast<const uint8_t *>("YOURUSER"), 8,
+        reinterpret_cast<const uint8_t *>("YOURPASSWORD"), 12,
         reinterpret_cast<const uint8_t *>("elevatesoft"), 11);
     CHECK(ct.size() == 24);
 
@@ -54,17 +54,19 @@ static void login_body_wraps_ciphertext() {
     CHECK(body[43] == 0x00);                                 // trailer
 }
 
-static void catalog_attach_for_nisaint_cs_matches_capture() {
-    // Captured byte sequence from pyodbc against YOURCATALOG.
+static void catalog_attach_matches_capture_layout() {
+    // Same layout as the pyodbc capture, with the catalog name
+    // substituted for the scrubbed original (the structure — lengths,
+    // trailers, reqcode — is what the capture established).
     auto body = build_catalog_attach_body("YOURCATALOG");
-    const std::array<uint8_t, 28> expected = {
+    const std::array<uint8_t, 29> expected = {
         // flag + reqcode 0x003C LE
         0x00, 0x3C, 0x00,
-        // inner_len = 4 + 10 + 5 = 19, LE
-        0x13, 0x00, 0x00, 0x00,
-        // inner: name_len 10 LE + "YOURCATALOG" + trailer 01 00 00 00 00
-        0x0A, 0x00, 0x00, 0x00,
-        'N', 'I', 'S', 'A', 'I', 'N', 'T', '_', 'C', 'S',
+        // inner_len = 4 + 11 + 5 = 20, LE
+        0x14, 0x00, 0x00, 0x00,
+        // inner: name_len 11 LE + "YOURCATALOG" + trailer 01 00 00 00 00
+        0x0B, 0x00, 0x00, 0x00,
+        'Y', 'O', 'U', 'R', 'C', 'A', 'T', 'A', 'L', 'O', 'G',
         0x01, 0x00, 0x00, 0x00, 0x00,
         // outer 2-byte trailer
         0x64, 0x00,
@@ -85,7 +87,7 @@ static void catalog_attach_scales_with_name_length() {
 
 int main() {
     login_body_wraps_ciphertext();
-    catalog_attach_for_nisaint_cs_matches_capture();
+    catalog_attach_matches_capture_layout();
     catalog_attach_scales_with_name_length();
     if (g_failures == 0) {
         std::printf("all phase-4 tests passed\n");

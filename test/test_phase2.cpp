@@ -4,6 +4,7 @@
 #include "dbisam/crypto.hpp"
 #include "dbisam/framing.hpp"
 #include "dbisam/wire.hpp"
+#include "blowfish.hpp"
 #include "md5.hpp"
 
 #include <array>
@@ -124,22 +125,57 @@ static void md5_empty_string() {
     CHECK(std::memcmp(out, expected.data(), 16) == 0);
 }
 
-static void login_ciphertext_matches_doc_worked_example() {
-    // DBISAM-PROTOCOL.md §5 worked example.
-    const char *user = "YOURUSER";
-    const char *pass = "YOURPASSWORD";
+static void login_ciphertext_round_trips() {
+    // The original worked-example expectation compared against bytes
+    // captured with real credentials, which were scrubbed from the repo.
+    // Instead, verify the full pipeline by decrypting our own output:
+    // Blowfish-CBC (IV=0) with key MD5(encrypt_password), plaintext
+    // `<u8 ulen><user><u8 plen><pass>` zero-padded to a multiple of 8.
+    const char *user = "YOURUSER";     // 8 bytes
+    const char *pass = "YOURPASSWORD"; // 12 bytes
     const char *epw  = "elevatesoft";
     auto ct = encrypt_login(
-        reinterpret_cast<const uint8_t *>(user), 6,
-        reinterpret_cast<const uint8_t *>(pass), 9,
+        reinterpret_cast<const uint8_t *>(user), 8,
+        reinterpret_cast<const uint8_t *>(pass), 12,
         reinterpret_cast<const uint8_t *>(epw),  11);
-    const std::array<uint8_t, 24> expected = {
-        0x57, 0x25, 0x56, 0x8E, 0x56, 0x01, 0xB0, 0x58,
-        0xD1, 0x7E, 0xE1, 0x77, 0x20, 0xB6, 0x95, 0x24,
-        0x78, 0x1F, 0x5A, 0x02, 0x17, 0xF2, 0x43, 0x90,
-    };
-    CHECK(ct.size() == expected.size());
-    CHECK(std::memcmp(ct.data(), expected.data(), expected.size()) == 0);
+    // 1 + 8 + 1 + 12 = 22 → padded to 24.
+    CHECK(ct.size() == 24);
+
+    uint8_t key[16];
+    dbisam_md5::compute(reinterpret_cast<const uint8_t *>(epw), 11, key);
+    dbisam_blowfish::Context bf{};
+    dbisam_blowfish::key_setup(bf, key, sizeof(key));
+
+    std::vector<uint8_t> pt = ct;
+    uint8_t prev[8] = {0}; // IV = 0
+    for (size_t off = 0; off < pt.size(); off += 8) {
+        uint8_t cipher_block[8];
+        std::memcpy(cipher_block, pt.data() + off, 8);
+        dbisam_blowfish::decrypt_block(bf, pt.data() + off);
+        for (int i = 0; i < 8; ++i) pt[off + i] ^= prev[i];
+        std::memcpy(prev, cipher_block, 8);
+    }
+
+    CHECK(pt[0] == 8);
+    CHECK(std::memcmp(pt.data() + 1, user, 8) == 0);
+    CHECK(pt[9] == 12);
+    CHECK(std::memcmp(pt.data() + 10, pass, 12) == 0);
+    CHECK(pt[22] == 0 && pt[23] == 0); // zero padding
+}
+
+static void login_rejects_overlong_credentials() {
+    // Lengths are single-byte prefixes; longer must throw, not truncate.
+    std::vector<uint8_t> big(256, 'x');
+    const char *epw = "elevatesoft";
+    bool threw = false;
+    try {
+        (void)encrypt_login(big.data(), big.size(),
+                            reinterpret_cast<const uint8_t *>("p"), 1,
+                            reinterpret_cast<const uint8_t *>(epw), 11);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    CHECK(threw);
 }
 
 int main() {
@@ -152,7 +188,8 @@ int main() {
     deflate_inflate_roundtrip();
     md5_known_vector();
     md5_empty_string();
-    login_ciphertext_matches_doc_worked_example();
+    login_ciphertext_round_trips();
+    login_rejects_overlong_credentials();
     if (g_failures == 0) {
         std::printf("all phase-2 tests passed\n");
         return 0;

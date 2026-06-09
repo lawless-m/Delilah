@@ -119,9 +119,6 @@ if(NOT WIN32 AND NOT APPLE)
         -Wl,--exclude-libs,ALL
     )
 endif()
-target_include_directories(${LOADABLE_EXTENSION_NAME}
-    PRIVATE ${CMAKE_SOURCE_DIR}/src/include
-)
 
 add_custom_command(
     TARGET ${LOADABLE_EXTENSION_NAME}

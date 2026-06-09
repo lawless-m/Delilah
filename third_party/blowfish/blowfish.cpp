@@ -178,6 +178,22 @@ void encrypt_words(const Context &ctx, uint32_t &xl, uint32_t &xr) {
     xr = R;
 }
 
+// Same Feistel network with the P-array applied in reverse.
+void decrypt_words(const Context &ctx, uint32_t &xl, uint32_t &xr) {
+    uint32_t L = xl;
+    uint32_t R = xr;
+    for (int i = 17; i > 1; --i) {
+        L ^= ctx.P[i];
+        R ^= feistel(ctx, L);
+        std::swap(L, R);
+    }
+    std::swap(L, R);
+    R ^= ctx.P[1];
+    L ^= ctx.P[0];
+    xl = L;
+    xr = R;
+}
+
 } // namespace
 
 void key_setup(Context &ctx, const uint8_t *key, size_t key_len) {
@@ -221,6 +237,26 @@ void encrypt_block(const Context &ctx, uint8_t block[8]) {
                  (static_cast<uint32_t>(block[6]) << 8) |
                  static_cast<uint32_t>(block[7]);
     encrypt_words(ctx, L, R);
+    block[0] = static_cast<uint8_t>(L >> 24);
+    block[1] = static_cast<uint8_t>(L >> 16);
+    block[2] = static_cast<uint8_t>(L >> 8);
+    block[3] = static_cast<uint8_t>(L);
+    block[4] = static_cast<uint8_t>(R >> 24);
+    block[5] = static_cast<uint8_t>(R >> 16);
+    block[6] = static_cast<uint8_t>(R >> 8);
+    block[7] = static_cast<uint8_t>(R);
+}
+
+void decrypt_block(const Context &ctx, uint8_t block[8]) {
+    uint32_t L = (static_cast<uint32_t>(block[0]) << 24) |
+                 (static_cast<uint32_t>(block[1]) << 16) |
+                 (static_cast<uint32_t>(block[2]) << 8) |
+                 static_cast<uint32_t>(block[3]);
+    uint32_t R = (static_cast<uint32_t>(block[4]) << 24) |
+                 (static_cast<uint32_t>(block[5]) << 16) |
+                 (static_cast<uint32_t>(block[6]) << 8) |
+                 static_cast<uint32_t>(block[7]);
+    decrypt_words(ctx, L, R);
     block[0] = static_cast<uint8_t>(L >> 24);
     block[1] = static_cast<uint8_t>(L >> 16);
     block[2] = static_cast<uint8_t>(L >> 8);
