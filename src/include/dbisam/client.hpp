@@ -53,6 +53,13 @@ struct ConnOpts {
     // instant but catalog-wide column introspection is empty until a
     // table is queried. Set via ATTACH (..., EAGER_SCHEMA true).
     bool eager_schema = false;
+    // When true, rows that fail to decode become all-NULL rows and blob
+    // fetch failures become NULL cells (with a stderr warning) instead
+    // of failing the query. Default false: any decode failure raises an
+    // error — silent NULLs are indistinguishable from real data. Set via
+    // ATTACH (..., LENIENT_DECODE true), the dbisam_scan named parameter,
+    // or the DBISAM_LENIENT_DECODE environment variable.
+    bool lenient_decode = false;
 };
 
 class Client {
@@ -61,14 +68,17 @@ public:
 
     Client(const Client &) = delete;
     Client &operator=(const Client &) = delete;
+    // Move-assignment is intentionally absent: Transport is move-
+    // constructible but not move-assignable, so a defaulted operator=
+    // would be silently deleted anyway.
     Client(Client &&) = default;
-    Client &operator=(Client &&) = default;
 
     Transport &transport() { return transport_; }
     bool compression() const { return compression_; }
     uint32_t batch_size() const { return batch_size_; }
     void set_batch_size(uint32_t v) { batch_size_ = v; }
     size_t blob_slot_length() const { return blob_slot_length_; }
+    bool lenient_decode() const { return lenient_decode_; }
 
     // Send a PrepareStatement (reqcode 0x0320) carrying `sql` and return
     // the raw schema-bearing response. SQL is twice-length-prefixed
@@ -111,16 +121,19 @@ public:
     std::vector<std::string> list_tables();
 
 private:
-    Client(Transport &&t, bool compression, uint32_t batch_size, size_t blob_slot_length)
+    Client(Transport &&t, bool compression, uint32_t batch_size, size_t blob_slot_length,
+           bool lenient_decode)
         : transport_(std::move(t)),
           compression_(compression),
           batch_size_(batch_size),
-          blob_slot_length_(blob_slot_length) {}
+          blob_slot_length_(blob_slot_length),
+          lenient_decode_(lenient_decode) {}
 
     Transport transport_;
     bool compression_;
     uint32_t batch_size_;
     size_t blob_slot_length_;
+    bool lenient_decode_;
 };
 
 // Wrap a login ciphertext in the LOGIN message body (reqcode 0x14):

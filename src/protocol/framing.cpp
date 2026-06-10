@@ -15,6 +15,13 @@ const std::array<uint8_t, 16> GUID = {
 
 static constexpr uint8_t SESSION_STATE_FLAG = 0x5A;
 
+// Sanity caps on server-supplied lengths. A legitimate response is a
+// few MB at most (batch_size rows × record width, or one blob payload);
+// these bounds only exist so a corrupt or hostile length field can't
+// make us allocate unbounded memory.
+static constexpr size_t MAX_BODY_LEN = 256u * 1024 * 1024;     // framed body
+static constexpr size_t MAX_INFLATED_LEN = 1024u * 1024 * 1024; // decompressed inner
+
 std::vector<uint8_t> wrap(const uint8_t *body, size_t body_len) {
     size_t raw_total = 20 + body_len;
     size_t aligned_total = (raw_total + 7) & ~static_cast<size_t>(7);
@@ -78,6 +85,11 @@ std::vector<uint8_t> inflate(const uint8_t *data, size_t len) {
             duckdb_miniz::mz_inflateEnd(&s);
             throw IoError(std::string("inflate failed: ret=") + std::to_string(ret));
         }
+        if (out.size() > MAX_INFLATED_LEN) {
+            duckdb_miniz::mz_inflateEnd(&s);
+            throw IoError("inflated payload exceeds " + std::to_string(MAX_INFLATED_LEN) +
+                          " bytes — refusing to decompress further");
+        }
         if (s.avail_in == 0 && produced == 0) {
             duckdb_miniz::mz_inflateEnd(&s);
             throw IoError("inflate stalled (need more input but stream not at end)");
@@ -140,6 +152,10 @@ std::vector<uint8_t> Transport::recv_msg() {
     if (total < 20) {
         throw IoError("bad total_len in header: " + std::to_string(total));
     }
+    if (total - 20 > MAX_BODY_LEN) {
+        throw IoError("body length " + std::to_string(total - 20) +
+                      " exceeds sanity cap " + std::to_string(MAX_BODY_LEN));
+    }
     std::vector<uint8_t> body(total - 20);
     if (!body.empty()) {
         read_exact(body.data(), body.size());
@@ -167,7 +183,11 @@ std::vector<uint8_t> Transport::send_recv(const uint8_t *body, size_t len) {
 std::vector<uint8_t> Transport::send_recv_compressed(const uint8_t *body, size_t len) {
     std::vector<uint8_t> to_send;
     if (len < 7) {
-        to_send.assign(body, body + len);
+        // Every message builder emits at least the 7-byte flag + reqcode
+        // + inner_len header; a shorter body can't carry the compression
+        // flag byte and would desync the session.
+        throw IoError("send_recv_compressed: body too short (" + std::to_string(len) +
+                      " bytes, need >= 7)");
     } else {
         uint16_t reqcode = static_cast<uint16_t>(body[1]) |
                            (static_cast<uint16_t>(body[2]) << 8);
@@ -256,24 +276,14 @@ Transport connect(const std::string &host, uint16_t port) {
             last_err = socket_last_error();
             continue;
         }
-        // 10s connect timeout via non-blocking + select.
+        // 10s connect timeout via non-blocking + poll/select.
         set_socket_nonblocking(fd, true);
         int crc = ::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         bool ok = false;
         if (crc == 0) {
             ok = true;
         } else if (socket_would_block()) {
-            fd_set wfds;
-            FD_ZERO(&wfds);
-            FD_SET(fd, &wfds);
-            timeval tv;
-            tv.tv_sec = 10;
-            tv.tv_usec = 0;
-            // POSIX: nfds is highest fd + 1. Windows: nfds is ignored
-            // (FD_SETSIZE check happens internally). Passing fd+1 works
-            // on POSIX; on Windows the value is harmless.
-            int nfds = static_cast<int>(fd) + 1;
-            int sel = ::select(nfds, nullptr, &wfds, nullptr, &tv);
+            int sel = socket_wait_writable(fd, 10'000);
             if (sel > 0) {
                 int so_err = 0;
                 socklen_t so_len = sizeof(so_err);

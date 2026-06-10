@@ -86,6 +86,9 @@ private:
     unique_ptr<DbisamSchemaEntry> main_schema_;
 
     std::mutex schema_mutex_;
+    // Held for the duration of EnsureEagerLoaded's probe loop (which
+    // runs outside schema_mutex_) so only one thread performs it.
+    std::mutex eager_load_mutex_;
     bool tables_loaded_ = false;
     std::vector<std::string> table_names_;
     bool eager_loaded_ = false;

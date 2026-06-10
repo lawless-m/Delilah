@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    name: unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Configure pulls the DuckDB source via FetchContent (needed for
+      # the vendored miniz), but we only build the pure-protocol test
+      # targets — not duckdb_static or the loadable extension — so the
+      # job stays in the minutes range.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build unit tests
+        run: >
+          cmake --build build --config Release -j 4 --target
+          test_phase2 test_phase3 test_phase4 test_phase5 test_phase7
+          test_text test_attach_options
+
+      - name: Run unit tests
+        run: ctest --test-dir build -C Release --output-on-failure

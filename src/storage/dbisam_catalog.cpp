@@ -1,6 +1,9 @@
 #include "dbisam/storage/dbisam_catalog.hpp"
+#include "dbisam/storage/dbisam_filter_render.hpp"
 #include "dbisam/storage/dbisam_schema_entry.hpp"
 #include "dbisam/storage/dbisam_table_entry.hpp"
+
+#include "dbisam/schema.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/parser/column_definition.hpp"
@@ -103,12 +106,17 @@ optional_ptr<CatalogEntry> DbisamCatalog::GetTableEntry(const std::string &name)
     std::vector<dbisam::Column> columns;
     try {
         auto client = OpenClient();
-        auto resp = client.query_raw("SELECT * FROM \"" + name + "\" WHERE 1=0");
+        auto resp = client.query_raw("SELECT * FROM " + QuoteDbisamIdent(name) + " WHERE 1=0");
         auto [cols, _end] = dbisam::parse_schema(resp);
         columns = std::move(cols);
-    } catch (const std::exception &) {
-        // Treat as "table doesn't exist" — let DuckDB surface a clean
-        // "table not found" rather than a wire-protocol error.
+    } catch (const dbisam::SchemaError &) {
+        // No schema blocks in the response — the server rejected the
+        // statement, which for this probe means the table doesn't exist.
+        // Let DuckDB surface a clean "table not found".
+        //
+        // Anything else (IoError: connect/login/timeout failures) must
+        // propagate — reporting a connectivity problem as "table does
+        // not exist" sends the user debugging the wrong thing.
         return nullptr;
     }
 
@@ -140,6 +148,11 @@ void DbisamCatalog::EnsureEagerLoaded() {
     if (!opts.eager_schema) {
         return;
     }
+    // Serialise the whole load: without this, two threads hitting the
+    // catalog simultaneously would both run the probe loop, and the
+    // server rejects concurrent logins — the losing thread's probes
+    // would fail and tables would appear to be missing.
+    std::lock_guard<std::mutex> load_guard(eager_load_mutex_);
     {
         std::lock_guard<std::mutex> g(schema_mutex_);
         if (eager_loaded_) {
@@ -147,8 +160,8 @@ void DbisamCatalog::EnsureEagerLoaded() {
         }
     }
     // GetTableNames()/GetTableEntry() take schema_mutex_ themselves, so
-    // probe outside the lock. GetTableEntry serially probes + caches each
-    // table into entries_ (serial: the server rejects concurrent logins).
+    // probe outside that lock. GetTableEntry serially probes + caches
+    // each table into entries_.
     for (const auto &name : GetTableNames()) {
         GetTableEntry(name);
     }

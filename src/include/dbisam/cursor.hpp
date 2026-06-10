@@ -85,6 +85,11 @@ public:
     Block next_block();
 
 private:
+    // Best-effort CloseCursor + ResetStatement + RemoveAllRemoteMemoryTables.
+    // Called from the destructor and from the constructor's error path
+    // (a throwing constructor never gets its destructor run).
+    void cleanup_server_cursor() noexcept;
+
     Transport &transport_;
     std::vector<Column> columns_;
     uint32_t batch_size_;

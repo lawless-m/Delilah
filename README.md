@@ -60,6 +60,8 @@ Named parameters:
 - `encrypt_password` (default `'elevatesoft'`)
 - `port` (default `12005`)
 - `compression` (default `TRUE`)
+- `lenient_decode` (default `FALSE`) — emit NULLs for rows/blobs that
+  fail to decode instead of raising an error (see below).
 - `top` — append a DBISAM `TOP n` clause to the SQL, so the server
   applies the cap instead of us streaming-and-stopping.
 
@@ -85,6 +87,20 @@ ATTACH 'YOURHOST/YOURCATALOG' AS em
      USER 'YOURUSER', PASSWORD 'YOURPASSWORD',
      ENCRYPT_PASSWORD 'elevatesoft', PORT 12005, COMPRESSION TRUE);
 ```
+
+Prefer the `USER`/`PASSWORD` options over embedding credentials in the
+URL — the attach path is retained as the database path and is visible
+in `duckdb_databases()`.
+
+### Decode strictness
+
+By default any row that fails to decode, or any BLOB/Memo fetch that the
+server rejects, raises an error — silent NULLs would be indistinguishable
+from real data. If you'd rather skim past damaged rows (e.g. a partially
+corrupt legacy table), opt in with `LENIENT_DECODE true` on `ATTACH`, the
+`lenient_decode := true` named parameter on `dbisam_scan`, or the
+`DBISAM_LENIENT_DECODE` environment variable; failures then become NULLs
+and a per-batch summary is written to stderr.
 
 ### Schema loading: lazy (default) vs `EAGER_SCHEMA`
 

@@ -84,7 +84,7 @@ std::vector<CellValue> decode_record(const uint8_t *record, size_t len,
             continue;
         }
         if (null_flag != 1) {
-            throw RowError("bad null-indicator 0x" + std::to_string(null_flag) +
+            throw RowError("bad null-indicator " + std::to_string(null_flag) +
                            " for column " + c.name);
         }
         size_t value_len = c.max;
