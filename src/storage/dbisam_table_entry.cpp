@@ -18,6 +18,8 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/optimizer/column_lifetime_analyzer.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
@@ -440,6 +442,27 @@ static void DbisamAttachedScanExecute(ClientContext &, TableFunctionInput &input
     state.total_emitted += emit;
 }
 
+// Generic expression pushdown accept test (e.g. WHERE LEFT(col,1) IN
+// (...)). DuckDB erases the FILTER node when we accept, so only accept
+// what RenderDbisamExpression can render — the exact code the scan
+// runs at init time to build the WHERE clause.
+bool DbisamPushdownExpression(ClientContext &, const LogicalGet &get, Expression &expr) {
+    vector<ColumnBinding> bindings;
+    ColumnLifetimeAnalyzer::ExtractColumnBindings(expr, bindings);
+    if (bindings.empty()) {
+        return false;
+    }
+    // The caller guarantees all bindings reference one column; reject
+    // virtual columns (rowid) — they have no server-side name.
+    auto &column_ids = get.GetColumnIds();
+    auto col_idx = bindings[0].column_index;
+    if (col_idx >= column_ids.size() || column_ids[col_idx].IsVirtualColumn()) {
+        return false;
+    }
+    // The column name doesn't affect renderability; probe with a dummy.
+    return RenderDbisamExpression(expr, QuoteDbisamIdent("probe")).has_value();
+}
+
 } // namespace
 
 TableFunction DbisamTableEntry::GetScanFunction(ClientContext &, unique_ptr<FunctionData> &bind_data) {
@@ -448,6 +471,7 @@ TableFunction DbisamTableEntry::GetScanFunction(ClientContext &, unique_ptr<Func
                      DbisamAttachedScanInitGlobal);
     tf.projection_pushdown = true;
     tf.filter_pushdown = true;
+    tf.pushdown_expression = DbisamPushdownExpression;
     // filter_prune left at default (false) — DuckDB still post-filters
     // even when we push down, so any unsupported filter shapes we
     // silently dropped get evaluated correctly on the DuckDB side.

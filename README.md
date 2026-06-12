@@ -131,6 +131,7 @@ table count (~15 s for ~600 tables); subsequent access is instant.
 |--------------------------|-----------------------------------------------------------------------------|
 | Projection pushdown      | Only the requested columns travel over the wire.                            |
 | `WHERE` filter pushdown  | `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`, `IS [NOT] NULL`, AND/OR, LIKE-prefix.|
+| Expression pushdown      | Single-column expressions over whitelisted functions (`LEFT`): `WHERE left(col, 1) IN ('4', '6')` runs server-side as `LEFT(...) IN (...)`, with NULL-semantics compensation for `<>` / `NOT IN`. |
 | `LIMIT n` pushdown       | Emits a trailing DBISAM `TOP n` so the server caps early (no full prepare); falls back to first-batch sizing when a non-pushable filter sits above the scan. |
 | Streaming scan           | Bounded memory; no whole-table materialisation in the extension.            |
 | BLOB / Memo columns      | Auto-resolved per row via `OpenBlob` / `FreeBlob`, PK auto-injected.        |

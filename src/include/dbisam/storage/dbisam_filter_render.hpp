@@ -31,6 +31,16 @@ std::string QuoteDbisamIdent(const std::string &name);
 std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
                                               const std::string &column_name);
 
+// Render a bound filter expression (generic expression pushdown /
+// EXPRESSION_FILTER, e.g. `LEFT(col, 1) IN ('4', '6')`). Column refs
+// render as `quoted_column` — generic pushdown guarantees exactly one
+// source column. This doubles as the accept test for the scan's
+// pushdown_expression callback: DuckDB ERASES the FILTER node when an
+// expression is accepted, so acceptance is a hard obligation and the
+// accept test and the scan-time renderer must be this same function.
+std::optional<std::string> RenderDbisamExpression(const Expression &expr,
+                                                  const std::string &quoted_column);
+
 // Convenience: render the whole set, joined with AND, columns named
 // via `column_names[column_id]`. Filters whose column_id is out of
 // range OR whose filter shape we don't support are silently dropped
