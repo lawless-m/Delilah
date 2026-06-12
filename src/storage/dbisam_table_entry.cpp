@@ -59,6 +59,11 @@ struct DbisamScanState : public GlobalTableFunctionState {
     std::vector<size_t> output_to_projected;
     std::vector<dbisam::Column> projected_columns;
 
+    // count(*) pushdown: the server answered SELECT COUNT(*) and we
+    // emit this many synthetic rows without ever opening a cursor.
+    bool synthetic_count = false;
+    idx_t synthetic_remaining = 0;
+
     // Streaming state — keep the Client (transport) alive for as long
     // as we're scanning, and pull RecordBlocks lazily. When DuckDB
     // hits its LIMIT and stops calling Execute, this state is
@@ -154,6 +159,46 @@ DbisamAttachedScanInitGlobal(ClientContext &context, TableFunctionInitInput &inp
         state->output_to_projected.push_back(select_cols.size());
         select_cols.push_back(QuoteDbisamIdent(bind.all_names[cid]));
     }
+    // Aggregate pushdown, count(*) case. A projection with no real
+    // columns means DuckDB only wants row cardinality — count(*)
+    // compiles to a ROWID-only scan, and ROWID values are synthesized
+    // sequentially either way. filter_prune is off, so a pushed filter
+    // always keeps its column in column_ids; a rowid-only scan therefore
+    // carries no filters and a bare server-side COUNT(*) is exact.
+    // Ask the server and emit that many rows instead of streaming the
+    // whole table through a driver column.
+    if (select_cols.empty() && !bind.all_names.empty() &&
+        (!input.filters || input.filters->filters.empty())) {
+        std::string sql = "SELECT COUNT(*) FROM " + QuoteDbisamIdent(bind.table->name);
+        if (std::getenv("DBISAM_SQL_DEBUG")) {
+            std::fprintf(stderr, "[dbisam-sql] %s\n", sql.c_str());
+        }
+        auto &txn = DbisamTransaction::Get(context, bind.table->catalog);
+        try {
+            auto client = std::make_unique<dbisam::Client>(txn.OpenClient());
+            auto result = client->query_decoded(sql, 1);
+            if (result.rows.empty() || result.rows[0].empty()) {
+                throw std::runtime_error("COUNT(*) returned no rows");
+            }
+            const auto &cell = result.rows[0][0];
+            int64_t n;
+            if (auto *v32 = std::get_if<int32_t>(&cell)) {
+                n = *v32;
+            } else if (auto *v64 = std::get_if<int64_t>(&cell)) {
+                n = *v64;
+            } else if (auto *vd = std::get_if<double>(&cell)) {
+                n = static_cast<int64_t>(*vd);
+            } else {
+                throw std::runtime_error("COUNT(*) returned a non-numeric cell");
+            }
+            state->synthetic_count = true;
+            state->synthetic_remaining = n > 0 ? static_cast<idx_t>(n) : 0;
+        } catch (const std::exception &e) {
+            throw IOException("dbisam_attached_scan: %s", e.what());
+        }
+        return std::move(state);
+    }
+
     // Always need at least one real column to drive the cursor and get
     // a row count. Pick column 0 if the request was rowid-only.
     bool driver_only = select_cols.empty();
@@ -313,6 +358,24 @@ static void DbisamAttachedScanExecute(ClientContext &, TableFunctionInput &input
     auto &bind = input.bind_data->Cast<DbisamScanBindData>();
     auto &state = input.global_state->Cast<DbisamScanState>();
     (void)bind;
+
+    // count(*) pushdown: no cursor, just emit the server-reported
+    // cardinality as batches of synthetic ROWIDs.
+    if (state.synthetic_count) {
+        idx_t emit = std::min<idx_t>(STANDARD_VECTOR_SIZE, state.synthetic_remaining);
+        for (idx_t outcol = 0; outcol < output.ColumnCount(); ++outcol) {
+            auto &out = output.data[outcol];
+            out.SetVectorType(VectorType::FLAT_VECTOR);
+            auto data = FlatVector::GetData<int64_t>(out);
+            for (idx_t r = 0; r < emit; ++r) {
+                data[r] = static_cast<int64_t>(state.total_emitted + r);
+            }
+        }
+        output.SetCardinality(emit);
+        state.synthetic_remaining -= emit;
+        state.total_emitted += emit;
+        return;
+    }
 
     // Pull more rows from the server if we've drained the current batch.
     if (state.batch_offset >= state.current_batch.size()) {
