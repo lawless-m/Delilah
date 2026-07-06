@@ -5,3 +5,15 @@ compile_commands.json
 *.duckdb_extension
 *.o
 *.a
+# --- build & tooling (auto-added) ---
+[Bb]in/
+[Oo]bj/
+publish/
+publish-trimmed/
+build32/
+[Dd]ebug/
+[Rr]elease/
+.devlog/
+.vscode/
+.claude/settings.local.json
+~$*
