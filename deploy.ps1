@@ -1,16 +1,18 @@
 #Requires -Version 7
 <#
-  deploy.ps1 -- build and deploy the Windows dbisam DuckDB extension.
+  deploy.ps1 -- build and deploy the dbisam DuckDB extension, Windows and Linux.
 
   This is the /deploy procedure (~/.claude/commands/deploy.md) written down for a C++
   DuckDB extension, after the 2026-09-21 deploy had to be worked out by hand:
 
-    * There are TWO live copies and nothing keeps them in step -- DuckDB only fetches
-      an extension on INSTALL / FORCE INSTALL:
-        - the web repo on vsprod, which deploy/upgrade-dbisam.cmd installs from;
+    * Nothing keeps the live copies in step -- DuckDB only fetches an extension on
+      INSTALL / FORCE INSTALL. There are:
+        - the web repo on vsprod (windows_amd64 + linux_amd64), which
+          deploy/upgrade-dbisam.cmd|.sh install from;
         - the rivsts05 share, which is what duckdb.bat sessions actually LOAD, because
-          the share's init.sql sets extension_directory to the share.
-      Updating one and not the other leaves half the estate on the old binary.
+          the share's init.sql sets extension_directory to the share;
+        - ~/.duckdb on each Linux host, refreshed from the web repo by upgrade-dbisam.sh.
+      Updating some and not others leaves part of the estate on the old binary.
     * Scheduled tasks on another server load the extension from the share and hold it
       open at more or less any time of day, so "close all sessions first" never
       reliably works. A plain overwrite is tried first; if the file is in
@@ -19,25 +21,30 @@
       ADMIN shell:
         Get-SmbOpenFile -CimSession rivsts05 | ? Path -like '*dbisam.duckdb_extension'
     * cmake / ninja / cl are not on PATH on the dev hosts; they come from Visual Studio.
+    * Linux is built on vsprod from its own checkout, which pulls from GitHub -- so
+      Linux can only ever ship a PUSHED commit from a CLEAN tree. -SkipLinux does a
+      Windows-only deploy, and is the only mode -AllowDirty is compatible with.
 
-  The new build is smoke-tested against live sem01 straight from build\ BEFORE either
-  live copy is touched. The smoke query is the Top-N LIKE regression fixed in f81b389:
-  it is read-only and fails loudly if pushed filters are being dropped.
-
-  NOT covered: the linux_amd64 build. That is built on vsprod (~/Git/Delilah, needs the
-  commit pushed) and published to the same web repo by hand.
+  Both builds are unit-tested and smoke-tested against live sem01 straight from their
+  build directories BEFORE any live copy is touched. The smoke query is the Top-N LIKE
+  regression fixed in f81b389: read-only, and fails loudly if pushed filters are
+  being dropped.
 
   Usage:
     pwsh -File deploy.ps1
     pwsh -File deploy.ps1 -Note "why this deploy happened"
+    pwsh -File deploy.ps1 -SkipLinux -AllowDirty
 #>
 [CmdletBinding()]
 param(
-    [string] $ShareRoot = '\\rivsts05\Software\Data Warehouse\duckdb',
-    [string] $WebHost   = 'vsprod',
-    [string] $WebRoot   = '/var/www/html/duckdb-ext',
-    [string] $Note      = '',
-    [switch] $AllowDirty
+    [string]   $ShareRoot  = '\\rivsts05\Software\Data Warehouse\duckdb',
+    [string]   $WebHost    = 'vsprod',                    # serves the web repo AND builds Linux
+    [string]   $WebRoot    = '/var/www/html/duckdb-ext',
+    [string]   $LinuxRepo  = 'Git/Delilah',               # checkout on $WebHost, relative to $HOME
+    [string[]] $LinuxHosts = @('vsprod', 'beast'),        # hosts with dbisam installed in ~/.duckdb
+    [string]   $Note       = '',
+    [switch]   $SkipLinux,
+    [switch]   $AllowDirty
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,7 +52,6 @@ Set-StrictMode -Version Latest
 
 $repo     = $PSScriptRoot
 $assembly = 'dbisam.duckdb_extension'
-$platform = 'windows_amd64'
 $build    = Join-Path $repo 'build'
 $built    = Join-Path $build $assembly
 $history  = 'R:\Outputs\Parquets\deploy\deploy_history.sqlite'
@@ -61,12 +67,17 @@ if (-not $m.Success) { throw 'No DUCKDB_VERSION_NORMALIZED in CMakeLists.txt -- 
 $ver = $m.Groups[1].Value
 $m = [regex]::Match((Get-Content (Join-Path $repo 'deploy\upgrade-dbisam.cmd') -Raw), "FORCE INSTALL dbisam FROM '([^']+)'")
 if (-not $m.Success) { throw 'No FORCE INSTALL url in deploy\upgrade-dbisam.cmd -- the web repo is undefined.' }
-$webUrl = "$($m.Groups[1].Value)/$ver/$platform/$assembly.gz"
-$webDir = "$WebRoot/$ver/$platform"
+$webBase = $m.Groups[1].Value
+$webUrl  = "$webBase/$ver/windows_amd64/$assembly.gz"
+$webDir  = "$WebRoot/$ver/windows_amd64"
+$linUrl  = "$webBase/$ver/linux_amd64/$assembly.gz"
+$linDir  = "$WebRoot/$ver/linux_amd64"
+$linBuilt     = "`$HOME/$LinuxRepo/build/$assembly"
+$linInstalled = "`$HOME/.duckdb/extensions/$ver/linux_amd64/$assembly"
 
 $duck        = Join-Path $ShareRoot 'duckdb.exe'
 $shareInit   = Join-Path $ShareRoot 'init.sql'
-$shareTarget = Join-Path $ShareRoot "$ver\$platform\$assembly"
+$shareTarget = Join-Path $ShareRoot "$ver\windows_amd64\$assembly"
 
 $smokeSql = "SELECT count(*), count(*) FILTER (WHERE code LIKE 'BPC-%') FROM " +
             "(SELECT code FROM sem01.customer WHERE code LIKE 'BPC-%' ORDER BY code DESC LIMIT 1000);"
@@ -84,10 +95,10 @@ function Get-GzBodySha($gzPath) {
     } finally { $in.Dispose() }
 }
 
-function Get-WebSha {
-    $tmp = Join-Path $scratch 'web-current.gz'
-    Invoke-WebRequest $webUrl -OutFile $tmp -TimeoutSec 300 | Out-Null
-    Get-GzBodySha $tmp
+function Get-WebSha($url) {
+    $tmp = Join-Path $scratch "web-$([guid]::NewGuid().ToString('n')).gz"
+    Invoke-WebRequest $url -OutFile $tmp -TimeoutSec 300 | Out-Null
+    try { Get-GzBodySha $tmp } finally { Remove-Item $tmp -Force }
 }
 
 # Run SQL through the share's duckdb.exe and return the last stdout line. $sql goes via
@@ -120,9 +131,36 @@ function Install-ShareFile($src) {
     catch { Rename-Item (Join-Path (Split-Path $shareTarget) $inuse) $assembly; throw }
 }
 
-function Invoke-Remote([string] $command) {
-    ssh -o BatchMode=yes $WebHost "set -e; cd '$webDir'; $command"
-    if ($LASTEXITCODE -ne 0) { throw "ssh $WebHost failed ($LASTEXITCODE): $command" }
+# Run a bash script on a remote host in a LOGIN shell (duckdb is only on that PATH) and
+# return its stdout lines. The script travels on stdin but is read in full before it
+# runs, so a command inside it that reads stdin cannot swallow the rest; tr strips the
+# CRs PowerShell adds. Remote stderr (build progress) goes straight to the console.
+function Invoke-Ssh([string] $sshHost, [string] $script) {
+    $out = "set -e`n$script`n" | ssh -o BatchMode=yes $sshHost 'bash -l -c "$(tr -d ''\r'')"'
+    if ($LASTEXITCODE -ne 0) { throw "ssh $sshHost failed ($LASTEXITCODE)" }
+    @($out) -replace '\x1b\[[0-9;]*m', ''
+}
+
+function Get-RemoteSha([string] $sshHost, [string] $path, [switch] $Gz) {
+    $cmd = $Gz ? "gunzip -c `"$path`" | sha256sum | cut -c1-64" : "sha256sum `"$path`" | cut -c1-64"
+    (Invoke-Ssh $sshHost $cmd | Select-Object -Last 1).ToUpper()
+}
+
+# Same smoke query, remotely. $prelude emits any SQL that must come first (LOAD/ATTACH --
+# the ATTACH line is grepped out of ~/.duckdbrc on the host and never leaves it).
+function Assert-LinuxSmoke([string] $sshHost, [string] $prelude, [string] $init, [string] $pathLike, [string] $what) {
+    $out = Invoke-Ssh $sshHost (@'
+umask 077; Q=$(mktemp /tmp/dbisam-smoke.XXXXXX); trap 'rm -f "$Q"' EXIT
+{ {PRELUDE}
+cat <<'SQL'
+SELECT install_path FROM duckdb_extensions() WHERE extension_name='dbisam';
+{SQL}
+SQL
+} > "$Q"
+duckdb -init {INIT} -csv -noheader -f "$Q" | tail -2
+'@).Replace('{PRELUDE}', $prelude).Replace('{SQL}', $smokeSql).Replace('{INIT}', $init)
+    if ($out.Count -ne 2 -or $out[0] -notlike $pathLike) { throw "$what loaded dbisam from '$($out[0])', expected $pathLike." }
+    Assert-Smoke $out[1] $what
 }
 
 Step 1 'Working tree'
@@ -130,24 +168,42 @@ $dirty = git -C $repo status --porcelain
 if ($dirty -and -not $AllowDirty) {
     throw "Working tree is dirty -- deployed bytes must trace back to a commit. Commit first, or pass -AllowDirty.`n$dirty"
 }
-$sha     = (git -C $repo rev-parse --short HEAD).Trim()
+$full    = (git -C $repo rev-parse HEAD).Trim()
+$sha     = $full.Substring(0, 7)
 $subject = (git -C $repo log -1 --pretty=%s).Trim()
 if ($dirty) { Write-Warning "Deploying uncommitted work -- what ships is NOT $sha." }
 Write-Host "  $sha  $subject"
+if (-not $SkipLinux) {
+    if ($dirty) { throw 'Linux is built from the pushed commit, so it cannot ship a dirty tree. Add -SkipLinux.' }
+    git -C $repo fetch -q origin
+    if (-not (git -C $repo branch -r --contains $full)) {
+        throw "$sha is not on origin -- $WebHost builds Linux from GitHub. Push first, or pass -SkipLinux."
+    }
+}
 
 New-Item -ItemType Directory $scratch | Out-Null
-$shareBackup = $null; $webBackup = $null; $shareChanged = $false; $webChanged = $false
+$shareBackup = $null; $shareChanged = $false; $webChanged = $false; $linWebChanged = $false
+$bak = "bak-$stamp"; $linHostsChanged = @(); $linFrom = $null; $linHash = $null
 try {
     Step 2 'Currently deployed'
     $exeVer = (& $duck -version)
     if ($exeVer -notlike "$ver *") { throw "Share duckdb.exe is '$exeVer' but the extension builds against $ver -- it would not load." }
     $fromHash = Get-Sha $shareTarget
-    $webFrom  = Get-WebSha
-    Write-Host ("  share  {0:n0} bytes  {1}" -f (Get-Item $shareTarget).Length, $fromHash)
-    Write-Host  "  web    $webFrom"
+    $webFrom  = Get-WebSha $webUrl
+    Write-Host ("  share        {0}  ({1:n0} bytes)" -f $fromHash, (Get-Item $shareTarget).Length)
+    Write-Host  "  web windows  $webFrom"
     if ($webFrom -ne $fromHash) { Write-Warning '  Share and web repo were ALREADY out of step.' }
+    if (-not $SkipLinux) {
+        $linFrom = Get-WebSha $linUrl
+        Write-Host "  web linux    $linFrom"
+        foreach ($h in $LinuxHosts) {
+            $s = Get-RemoteSha $h $linInstalled
+            Write-Host "  $($h.PadRight(12)) $s"
+            if ($s -ne $linFrom) { Write-Warning "  $h and the web repo were ALREADY out of step." }
+        }
+    }
 
-    Step 3 'Build + unit tests'
+    Step 3 'Build + unit tests (Windows)'
     $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (-not $vs) { throw 'No Visual Studio install with the C++ tools found (vswhere).' }
@@ -157,7 +213,7 @@ try {
     cmd /c ("call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1" +
             " && cmake -S `"$repo`" -B `"$build`" -G Ninja -DCMAKE_BUILD_TYPE=Release" +
             " && cmake --build `"$build`"" +
-            " && ctest --test-dir `"$build`" --output-on-failure") | Select-Object -Last 15 | Write-Host
+            " && ctest --test-dir `"$build`" --output-on-failure") | Select-Object -Last 4 | Write-Host
     if ($LASTEXITCODE -ne 0) { throw "build/ctest exited $LASTEXITCODE" }
     $toHash = Get-Sha $built
     $toSize = (Get-Item $built).Length
@@ -166,27 +222,60 @@ try {
     if ($toSize -lt 10MB) { throw "$built is only $toSize bytes -- not a statically linked extension." }
     if ($toHash -eq $fromHash -and $toHash -eq $webFrom) { Write-Warning '  Bytes identical to what is already deployed.' }
 
-    Step 4 'Smoke test the new build against sem01, before touching anything live'
+    if (-not $SkipLinux) {
+        Step 4 "Build + unit tests (Linux, on $WebHost)"
+        $r = Invoke-Ssh $WebHost (@'
+cd "$HOME/{REPO}"
+test -z "$(git status --porcelain)" || { echo "remote checkout is dirty" >&2; exit 1; }
+git pull -q --ff-only
+test "$(git rev-parse HEAD)" = "{FULL}" || { echo "remote HEAD is $(git rev-parse --short HEAD), not {FULL}" >&2; exit 1; }
+L=$(mktemp /tmp/dbisam-build.XXXXXX); trap 'rm -f "$L"' EXIT
+# -j3 of 4 cores: this is a production box.
+nice -n 10 cmake --build build -j3 >"$L" 2>&1 || { tail -25 "$L" >&2; exit 1; }
+(cd build && ctest --output-on-failure) >"$L" 2>&1 || { tail -40 "$L" >&2; exit 1; }
+grep 'tests passed' "$L" >&2
+echo "$(sha256sum build/{ASM} | cut -c1-64) $(stat -c %s build/{ASM})"
+'@).Replace('{REPO}', $LinuxRepo).Replace('{FULL}', $full).Replace('{ASM}', $assembly)
+        $linHash, $linSize = ($r | Select-Object -Last 1) -split ' '
+        $linHash = $linHash.ToUpper()
+        Write-Host ("  built  {0:n0} bytes  {1}" -f [long]$linSize, $linHash)
+        if ([long]$linSize -lt 10MB) { throw "Linux build is only $linSize bytes -- not a statically linked extension." }
+        if ($linHash -eq $linFrom) { Write-Warning '  Bytes identical to what is already deployed.' }
+    }
+
+    Step 5 'Smoke test the new builds against sem01, before touching anything live'
     $attach = (Select-String -Path $shareInit -Pattern '\bAS sem01\b' | Select-Object -First 1).Line
     if (-not $attach) { throw "No sem01 ATTACH line in $shareInit." }
-    Assert-Smoke (Invoke-Duck 'NUL' "LOAD '$($built -replace '\\','/')';`n$attach`n$smokeSql") 'build\'
+    Assert-Smoke (Invoke-Duck 'NUL' "LOAD '$($built -replace '\\','/')';`n$attach`n$smokeSql") 'windows build\'
+    if (-not $SkipLinux) {
+        # No path assertion here ('*'): install_path reports the INSTALLED copy's .info
+        # metadata even after an explicit-path LOAD, which -init /dev/null makes unambiguous.
+        Assert-LinuxSmoke $WebHost "echo `"LOAD '$linBuilt';`"; grep 'AS sem01' ~/.duckdbrc" '/dev/null' '*' 'linux build/'
+    }
 
-    Step 5 'Backup'
-    $shareBackup = "$shareTarget.bak-$stamp"
+    Step 6 'Backup'
+    $shareBackup = "$shareTarget.$bak"
     Copy-Item $shareTarget $shareBackup
     if ((Get-Sha $shareBackup) -ne $fromHash) { throw "Backup $shareBackup does not match the live extension." }
     Write-Host "  $shareBackup"
-    $webBackup = "$assembly.gz.bak-$stamp"
-    Invoke-Remote "cp -p $assembly.gz $webBackup"
-    Write-Host "  ${WebHost}:$webDir/$webBackup"
+    Invoke-Ssh $WebHost "cp -p '$webDir/$assembly.gz' '$webDir/$assembly.gz.$bak'" | Out-Null
+    Write-Host "  ${WebHost}:$webDir/$assembly.gz.$bak"
+    if (-not $SkipLinux) {
+        Invoke-Ssh $WebHost "cp -p '$linDir/$assembly.gz' '$linDir/$assembly.gz.$bak'" | Out-Null
+        Write-Host "  ${WebHost}:$linDir/$assembly.gz.$bak"
+        foreach ($h in $LinuxHosts) {
+            Invoke-Ssh $h "cp -p `"$linInstalled`" `"$linInstalled.$bak`"" | Out-Null
+            Write-Host "  ${h}:~/.duckdb/.../$assembly.$bak"
+        }
+    }
 
-    Step 6 "Deploy -> $shareTarget"
+    Step 7 "Deploy -> $shareTarget"
     $shareChanged = $true
     Install-ShareFile $built
     if ((Get-Sha $shareTarget) -ne $toHash) { throw 'Share copy does not match the build.' }
     Write-Host "  verified $toHash"
 
-    Step 7 "Deploy -> $webUrl"
+    Step 8 "Deploy -> $webUrl"
     $gzLocal = Join-Path $scratch "$assembly.gz"
     $in = [IO.File]::OpenRead($built); $out = [IO.File]::Create($gzLocal)
     try {
@@ -197,51 +286,88 @@ try {
     $webChanged = $true
     scp -q -o BatchMode=yes $gzLocal "${WebHost}:$webDir/$assembly.gz.upload-tmp"
     if ($LASTEXITCODE -ne 0) { throw "scp to $WebHost failed ($LASTEXITCODE)" }
-    Invoke-Remote "chmod 644 $assembly.gz.upload-tmp; mv -f $assembly.gz.upload-tmp $assembly.gz"
-    if ((Get-WebSha) -ne $toHash) { throw "Body served at $webUrl does not match the build." }
+    Invoke-Ssh $WebHost "cd '$webDir'; chmod 644 $assembly.gz.upload-tmp; mv -f $assembly.gz.upload-tmp $assembly.gz" | Out-Null
+    if ((Get-WebSha $webUrl) -ne $toHash) { throw "Body served at $webUrl does not match the build." }
     Write-Host "  verified over HTTPS $toHash"
 
-    Step 8 'Smoke test the real entry point (share duckdb.exe + init.sql)'
+    if (-not $SkipLinux) {
+        Step 9 "Deploy -> $linUrl"
+        $linWebChanged = $true
+        Invoke-Ssh $WebHost ("cd '$linDir'; gzip -9 -c `"$linBuilt`" > $assembly.gz.upload-tmp; chmod 644 $assembly.gz.upload-tmp; " +
+                             "mv -f $assembly.gz.upload-tmp $assembly.gz") | Out-Null
+        if ((Get-WebSha $linUrl) -ne $linHash) { throw "Body served at $linUrl does not match the Linux build." }
+        Write-Host "  verified over HTTPS $linHash"
+
+        Step 10 "Install on $($LinuxHosts -join ', ') (deploy/upgrade-dbisam.sh, from the web repo)"
+        $upgrade = Get-Content (Join-Path $repo 'deploy\upgrade-dbisam.sh') -Raw
+        foreach ($h in $LinuxHosts) {
+            $linHostsChanged += $h
+            Invoke-Ssh $h $upgrade | Out-Null
+            if ((Get-RemoteSha $h $linInstalled) -ne $linHash) { throw "$h installed copy does not match the Linux build." }
+            Write-Host "  $($h.PadRight(12)) verified $linHash"
+        }
+    }
+
+    Step 11 'Smoke test the real entry points'
     $loaded = Invoke-Duck $shareInit "SELECT install_path FROM duckdb_extensions() WHERE extension_name='dbisam';"
     if ($loaded -ne $shareTarget) { throw "Launcher loaded dbisam from '$loaded', not $shareTarget." }
-    Assert-Smoke (Invoke-Duck $shareInit $smokeSql) 'share'
+    Assert-Smoke (Invoke-Duck $shareInit $smokeSql) 'share init.sql'
+    if (-not $SkipLinux) {
+        foreach ($h in $LinuxHosts) { Assert-LinuxSmoke $h ':' '~/.duckdbrc' "*/.duckdb/extensions/$ver/linux_amd64/$assembly" "$h ~/.duckdbrc" }
+    }
 }
 catch {
     Write-Host "`nDEPLOY FAILED: $_" -ForegroundColor Red
+    function Report($what, $now, $want, $kept) {
+        if ($now -eq $want) { Write-Host "  $what rollback verified: $now" -ForegroundColor Yellow }
+        else { Write-Host "  $what ROLLBACK FAILED -- is $now, expected $want. Backup kept at $kept" -ForegroundColor Red }
+    }
     if ($shareChanged) {
-        Write-Host "Rolling back share from $shareBackup ..." -ForegroundColor Yellow
         try { Install-ShareFile $shareBackup } catch { Write-Host "  $_" -ForegroundColor Red }
-        $rolled = Get-Sha $shareTarget
-        if ($rolled -eq $fromHash) { Write-Host "  Rollback verified: $rolled" -ForegroundColor Yellow }
-        else { Write-Host "  ROLLBACK FAILED -- share is $rolled, expected $fromHash. Backup kept at $shareBackup" -ForegroundColor Red }
+        Report 'share' (Get-Sha $shareTarget) $fromHash $shareBackup
     }
     if ($webChanged) {
-        Write-Host "Rolling back web repo from $webBackup ..." -ForegroundColor Yellow
-        try {
-            Invoke-Remote "cp -p $webBackup $assembly.gz"
-            $rolled = Get-WebSha
-            if ($rolled -eq $webFrom) { Write-Host "  Rollback verified: $rolled" -ForegroundColor Yellow }
-            else { Write-Host "  ROLLBACK FAILED -- web is $rolled, expected $webFrom. Backup kept at $webDir/$webBackup" -ForegroundColor Red }
-        } catch { Write-Host "  ROLLBACK FAILED -- $_. Backup kept at $webDir/$webBackup" -ForegroundColor Red }
+        try { Invoke-Ssh $WebHost "cp -p '$webDir/$assembly.gz.$bak' '$webDir/$assembly.gz'" | Out-Null; Report 'web windows' (Get-WebSha $webUrl) $webFrom "$webDir/$assembly.gz.$bak" }
+        catch { Write-Host "  web windows ROLLBACK FAILED -- $_. Backup kept at $webDir/$assembly.gz.$bak" -ForegroundColor Red }
+    }
+    if ($linWebChanged) {
+        try { Invoke-Ssh $WebHost "cp -p '$linDir/$assembly.gz.$bak' '$linDir/$assembly.gz'" | Out-Null; Report 'web linux' (Get-WebSha $linUrl) $linFrom "$linDir/$assembly.gz.$bak" }
+        catch { Write-Host "  web linux ROLLBACK FAILED -- $_. Backup kept at $linDir/$assembly.gz.$bak" -ForegroundColor Red }
+    }
+    foreach ($h in $linHostsChanged) {
+        # Restores the host's OWN previous copy, which may differ from the old web body.
+        try { Invoke-Ssh $h "cp -p `"$linInstalled.$bak`" `"$linInstalled`"" | Out-Null; Write-Host "  $h restored from .$bak ($(Get-RemoteSha $h $linInstalled))" -ForegroundColor Yellow }
+        catch { Write-Host "  $h ROLLBACK FAILED -- $_. Backup kept at ~/.duckdb/.../$assembly.$bak" -ForegroundColor Red }
     }
     Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
     throw
 }
 
-Step 9 'Record'
-$fullNote = "Commit ${sha}: $subject. Share + web repo ($ver/$platform); web was $webFrom. Smoke: Top-N LIKE on sem01 OK from build\ and via share init.sql."
+Step 12 'Record'
+$fullNote = "Commit ${sha}: $subject. Share + web repo ($ver/windows_amd64); web was $webFrom. Smoke: Top-N LIKE on sem01 OK from build\ and via share init.sql."
 if ($Note) { $fullNote = "$Note $fullNote" }
 & $recorder -SqliteOut $history -Assembly $assembly -Project 'Delilah' `
     -FromHash $fromHash -ToHash $toHash -DeployedBy $env:USERNAME -Note $fullNote
+if (-not $SkipLinux) {
+    $linNote = "Commit ${sha}: $subject. Built on $WebHost; web repo ($ver/linux_amd64) + ~/.duckdb on $($LinuxHosts -join ', '). Smoke: Top-N LIKE on sem01 OK from build/ and via ~/.duckdbrc on each host."
+    if ($Note) { $linNote = "$Note $linNote" }
+    & $recorder -SqliteOut $history -Assembly "$assembly.linux_amd64" -Project 'Delilah' `
+        -FromHash $linFrom -ToHash $linHash -DeployedBy $env:USERNAME -Note $linNote
+}
 
-Step 10 'Clean up'
+Step 13 'Clean up'
 Remove-Item $shareBackup -Force; Write-Host "  removed $shareBackup"
-Invoke-Remote "rm -f $webBackup"; Write-Host "  removed ${WebHost}:$webDir/$webBackup"
+Invoke-Ssh $WebHost "rm -f '$webDir/$assembly.gz.$bak'" | Out-Null; Write-Host "  removed ${WebHost}:$webDir/$assembly.gz.$bak"
+if (-not $SkipLinux) {
+    Invoke-Ssh $WebHost "rm -f '$linDir/$assembly.gz.$bak'" | Out-Null; Write-Host "  removed ${WebHost}:$linDir/$assembly.gz.$bak"
+    foreach ($h in $LinuxHosts) { Invoke-Ssh $h "rm -f `"$linInstalled.$bak`"" | Out-Null; Write-Host "  removed ${h}:~/.duckdb/.../$assembly.$bak" }
+}
 # Leftovers from earlier rename swaps; still-loaded ones refuse and are left for next time.
 Get-ChildItem (Split-Path $shareTarget) -Filter "$assembly.inuse-*" | ForEach-Object {
     try { Remove-Item $_.FullName -Force; Write-Host "  removed $($_.Name)" } catch { Write-Host "  $($_.Name) still in use -- left" }
 }
 Remove-Item $scratch -Recurse -Force
 
-Write-Host "`nDeployed $assembly  $fromHash -> $toHash" -ForegroundColor Green
-Write-Host 'linux_amd64 is NOT covered by this script -- see the header.' -ForegroundColor Yellow
+Write-Host "`nDeployed $assembly  windows $fromHash -> $toHash" -ForegroundColor Green
+if ($SkipLinux) { Write-Host 'linux_amd64 was SKIPPED (-SkipLinux).' -ForegroundColor Yellow }
+else { Write-Host "Deployed $assembly  linux   $linFrom -> $linHash" -ForegroundColor Green }

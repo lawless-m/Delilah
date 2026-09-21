@@ -172,7 +172,7 @@ renderer). `test_filter_render` is the only one that links
 `duckdb_static`; CI skips it. The storage-layer subclasses are exercised
 against the live server.
 
-`deploy.ps1` builds, tests and publishes the Windows extension (site-specific).
+`deploy.ps1` builds, tests and publishes the Windows and Linux extensions (site-specific).
 
 For live tests, set `DBISAM_USER` and `DBISAM_PASSWORD`:
 
