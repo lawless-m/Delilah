@@ -165,10 +165,14 @@ The authoritative grammar is the Prolog DCG in [Dibdog][dibdog].
 cd build && ctest
 ```
 
-Seven unit-test executables (wire/framing/crypto, message builders,
+Eight unit-test executables (wire/framing/crypto, message builders,
 schema/row decoders, blob slot/bookmark/response codecs,
-Windows-1252→UTF-8 transcoder, ATTACH parser). The filter renderer and
-storage-layer subclasses are exercised against the live server.
+Windows-1252→UTF-8 transcoder, ATTACH parser, TableFilter→WHERE
+renderer). `test_filter_render` is the only one that links
+`duckdb_static`; CI skips it. The storage-layer subclasses are exercised
+against the live server.
+
+`deploy.ps1` builds, tests and publishes the Windows extension (site-specific).
 
 For live tests, set `DBISAM_USER` and `DBISAM_PASSWORD`:
 
