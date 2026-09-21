@@ -8,8 +8,9 @@
 //     (DBISAM implicitly casts to the column type in comparison)
 //
 // Conservative: only filter shapes we can render exactly are pushed
-// down. Unrecognised shapes return std::nullopt and DuckDB applies
-// the filter post-fetch.
+// down. Unrecognised shapes return std::nullopt; DuckDB does NOT apply
+// pushed filters post-fetch, so RenderDbisamFilterSet only tolerates
+// that for skippable (OPTIONAL / DYNAMIC / BLOOM) filters.
 
 #pragma once
 
@@ -42,9 +43,10 @@ std::optional<std::string> RenderDbisamExpression(const Expression &expr,
                                                   const std::string &quoted_column);
 
 // Convenience: render the whole set, joined with AND, columns named
-// via `column_names[column_id]`. Filters whose column_id is out of
-// range OR whose filter shape we don't support are silently dropped
-// (DuckDB applies them post-fetch — correctness preserved).
+// via `column_names[column_id]`. Only skippable filters (OPTIONAL /
+// DYNAMIC / BLOOM) may be dropped when unrenderable — DuckDB does not
+// post-filter pushed filters, so an unrenderable mandatory filter
+// throws rather than returning unfiltered rows.
 //
 // `applied` receives the column-ids of filters we successfully pushed
 // down, so the caller can tell DuckDB to skip them (if filter_prune

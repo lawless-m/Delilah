@@ -291,6 +291,26 @@ std::optional<std::string> RenderDbisamExpression(const Expression &expr,
     }
 }
 
+// Filters DuckDB does not rely on the scan to apply: OPTIONAL_FILTER by
+// contract, DYNAMIC/BLOOM because the operator that produced them (Top-N,
+// join) still enforces the predicate itself. Everything else in a
+// TableFilterSet is MANDATORY — DuckDB has removed it from the plan.
+static bool IsSkippableFilter(const TableFilter &filter) {
+    switch (filter.filter_type) {
+    case TableFilterType::OPTIONAL_FILTER:
+    case TableFilterType::DYNAMIC_FILTER:
+    case TableFilterType::BLOOM_FILTER:
+        return true;
+    case TableFilterType::CONJUNCTION_AND:
+        for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+            if (!IsSkippableFilter(*child)) return false;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
                                               const std::string &column_name) {
     auto qcol = QuoteDbisamIdent(column_name);
@@ -318,11 +338,18 @@ std::optional<std::string> RenderDbisamFilter(const TableFilter &filter,
         bool first = true;
         for (auto &child : cf.child_filters) {
             auto rendered = RenderDbisamFilter(*child, column_name);
-            if (!rendered) return std::nullopt; // all-or-nothing for an AND group
+            if (!rendered) {
+                // A skippable child only narrows the scan (e.g. the Top-N
+                // Dynamic Filter DuckDB ANDs onto a LIKE-prefix range for
+                // ORDER BY ... LIMIT) — drop it, keep the mandatory rest.
+                if (IsSkippableFilter(*child)) continue;
+                return std::nullopt; // all-or-nothing for the mandatory children
+            }
             if (!first) out += " AND ";
             out += *rendered;
             first = false;
         }
+        if (first) return std::nullopt; // every child was skipped
         out += ")";
         return out;
     }
@@ -410,15 +437,16 @@ std::string RenderDbisamFilterSet(const TableFilterSet &filters,
             std::fprintf(stderr, "[dbisam-filter] col=%zu (%s) type=%s\n",
                          col_idx, colname, FilterTypeName(entry.second->filter_type));
         }
-        // A bare EXPRESSION_FILTER only exists because our
-        // pushdown_expression callback accepted it — and DuckDB erased
-        // the FILTER node in exchange. Failing to render it here would
-        // silently return unfiltered rows, so fail loudly instead.
-        bool must_render = entry.second->filter_type == TableFilterType::EXPRESSION_FILTER;
+        // With filter_pushdown on, DuckDB removes a pushed filter from
+        // the plan and trusts the scan to apply it — there is no
+        // post-filter (filter_prune only governs column pruning). Only
+        // skippable filters may be dropped; failing to render anything
+        // else would silently return unfiltered rows, so fail loudly.
+        bool must_render = !IsSkippableFilter(*entry.second);
         if (col_idx >= column_names.size() || column_names[col_idx].empty()) {
             if (must_render) {
-                throw InternalException(
-                    "dbisam: accepted pushdown expression targets a column with no "
+                throw NotImplementedException(
+                    "dbisam: mandatory pushed filter targets a column with no "
                     "server-side name (col_idx %llu)", col_idx);
             }
             continue;
@@ -426,8 +454,8 @@ std::string RenderDbisamFilterSet(const TableFilterSet &filters,
         auto rendered = RenderDbisamFilter(*entry.second, column_names[col_idx]);
         if (!rendered) {
             if (must_render) {
-                throw InternalException(
-                    "dbisam: accepted pushdown expression could not be rendered: %s",
+                throw NotImplementedException(
+                    "dbisam: mandatory pushed filter could not be rendered: %s",
                     entry.second->ToString(column_names[col_idx]));
             }
             if (debug) std::fprintf(stderr, "[dbisam-filter]   -> not rendered (unsupported shape)\n");

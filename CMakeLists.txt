@@ -181,3 +181,21 @@ target_include_directories(test_attach_options PRIVATE
     ${CMAKE_SOURCE_DIR}/src/include
 )
 add_test(NAME attach_options COMMAND test_attach_options)
+
+# The filter renderer works on DuckDB's TableFilter classes, so this one
+# links duckdb_static (no server needed).
+add_executable(test_filter_render
+    test/test_filter_render.cpp
+    src/storage/dbisam_filter_render.cpp
+)
+target_link_libraries(test_filter_render PRIVATE
+    duckdb_static
+    dummy_static_extension_loader
+)
+# Static link: stop MSVC decorating DUCKDB_API as dllimport.
+target_compile_definitions(test_filter_render PRIVATE DUCKDB_STATIC_BUILD)
+target_include_directories(test_filter_render PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/include
+    ${duckdb_SOURCE_DIR}/src/include
+)
+add_test(NAME filter_render COMMAND test_filter_render)

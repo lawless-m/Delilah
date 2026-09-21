@@ -30,4 +30,5 @@ jobs:
           test_text test_attach_options
 
       - name: Run unit tests
-        run: ctest --test-dir build -C Release --output-on-failure
+        # filter_render links duckdb_static, which this job doesn't build.
+        run: ctest --test-dir build -C Release --output-on-failure -E filter_render

@@ -472,9 +472,10 @@ TableFunction DbisamTableEntry::GetScanFunction(ClientContext &, unique_ptr<Func
     tf.projection_pushdown = true;
     tf.filter_pushdown = true;
     tf.pushdown_expression = DbisamPushdownExpression;
-    // filter_prune left at default (false) — DuckDB still post-filters
-    // even when we push down, so any unsupported filter shapes we
-    // silently dropped get evaluated correctly on the DuckDB side.
+    // filter_pushdown means DuckDB does NOT post-filter: every
+    // non-optional filter in the TableFilterSet must be applied by the
+    // scan (RenderDbisamFilterSet throws if it can't). filter_prune left
+    // at default (false) — it only governs pruning filter-only columns.
 
     // Pre-populate bind_data so the planner can request statistics etc.
     // before re-binding. The actual bind callback re-derives the same
