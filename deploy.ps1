@@ -54,7 +54,6 @@ $repo     = $PSScriptRoot
 $assembly = 'dbisam.duckdb_extension'
 $build    = Join-Path $repo 'build'
 $built    = Join-Path $build $assembly
-$history  = 'R:\Outputs\Parquets\deploy\deploy_history.sqlite'
 $recorder = 'R:\Scripts\Record-Deploy.ps1'
 $stamp    = Get-Date -Format 'yyyyMMdd-HHmmss'
 $scratch  = Join-Path ([IO.Path]::GetTempPath()) "dbisam-deploy-$stamp"
@@ -346,12 +345,12 @@ catch {
 Step 12 'Record'
 $fullNote = "Commit ${sha}: $subject. Share + web repo ($ver/windows_amd64); web was $webFrom. Smoke: Top-N LIKE on sem01 OK from build\ and via share init.sql."
 if ($Note) { $fullNote = "$Note $fullNote" }
-& $recorder -SqliteOut $history -Assembly $assembly -Project 'Delilah' `
+& $recorder -Assembly $assembly -Project 'Delilah' `
     -FromHash $fromHash -ToHash $toHash -DeployedBy $env:USERNAME -Note $fullNote
 if (-not $SkipLinux) {
     $linNote = "Commit ${sha}: $subject. Built on $WebHost; web repo ($ver/linux_amd64) + ~/.duckdb on $($LinuxHosts -join ', '). Smoke: Top-N LIKE on sem01 OK from build/ and via ~/.duckdbrc on each host."
     if ($Note) { $linNote = "$Note $linNote" }
-    & $recorder -SqliteOut $history -Assembly "$assembly.linux_amd64" -Project 'Delilah' `
+    & $recorder -Assembly "$assembly.linux_amd64" -Project 'Delilah' `
         -FromHash $linFrom -ToHash $linHash -DeployedBy $env:USERNAME -Note $linNote
 }
 
